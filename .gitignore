@@ -141,4 +141,5 @@ wandb
 outputs
 cls_num_list.txt
 co_occurrence_matrix.npy
-experimentsexperiments/*/best_model.pt
+experiments/
+experiments/*/best_model.pt
