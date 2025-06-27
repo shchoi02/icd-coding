@@ -17,14 +17,17 @@
 import torch
 import torch.utils.checkpoint
 from torch import nn
+from typing import Optional
 
 from transformers import RobertaModel, AutoConfig
 
 from src.models.modules.attention import LabelAttention
+from src.losses.mfm import MultiGrainedFocalLoss
 
 
 class PLMICD(nn.Module):
-    def __init__(self, num_classes: int, model_path: str, **kwargs):
+    def __init__(self, num_classes: int, model_path: str,
+                 cls_num_list: Optional[list[int]] = None, **kwargs):
         super().__init__()
         self.config = AutoConfig.from_pretrained(
             model_path, num_labels=num_classes, finetuning_task=None
@@ -37,7 +40,11 @@ class PLMICD(nn.Module):
             projection_size=self.config.hidden_size,
             num_classes=num_classes,
         )
-        self.loss = torch.nn.functional.binary_cross_entropy_with_logits
+        # self.loss = torch.nn.functional.binary_cross_entropy_with_logits
+        
+        self.loss = MultiGrainedFocalLoss()
+        self.loss.create_weight(cls_num_list)
+        
 
     def get_loss(self, logits, targets):
         return self.loss(logits, targets)

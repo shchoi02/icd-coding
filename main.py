@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 import hydra
+import torch
 from omegaconf import OmegaConf
 from rich.pretty import pprint
 
@@ -25,6 +26,30 @@ from src.utils.seed import set_seed
 
 LOGGER = logging.getLogger(name=__file__)
 LOGGER.setLevel(logging.INFO)
+
+
+def _raw_targets_iter(samples, target_col: str = "target"):
+    for s in samples:
+        if isinstance(s, dict):
+            yield s.get("targets", s.get(target_col))
+        else:               
+            yield s[1]
+
+
+def get_cls_num_list(
+    data,
+    label_transform,
+    split: str = "train",
+) -> list[int]:
+    samples = getattr(data, split)      
+    C = label_transform.num_classes
+    counts = torch.zeros(C, dtype=torch.long)
+
+    for raw in _raw_targets_iter(samples):
+        idxs = label_transform.get_indices(raw)
+        counts[idxs] += 1
+
+    return counts.tolist()
 
 
 def deterministic() -> None:
@@ -88,9 +113,15 @@ def main(cfg: OmegaConf) -> None:
         label_transform=label_transform,
         text_transform=text_transform,
     )
+    
+    cls_num_list = get_cls_num_list(data, label_transform)
+    file_path = 'cls_num_list.txt'
+    with open(file_path, 'w') as file:
+        for item in cls_num_list:
+            file.write(str(item) + '\n')
 
     model = get_model(
-        config=cfg.model, data_info=lookups.data_info, text_encoder=text_encoder
+        config=cfg.model, data_info=lookups.data_info, text_encoder=text_encoder, cls_num_list=cls_num_list
     )
     model.to(device)
 
