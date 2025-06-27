@@ -16,7 +16,7 @@ class MultiGrainedFocalLoss(nn.Module):
         self.eps = eps
         self.distribution_path=distribution_path
 
-    
+    @torch.no_grad()
     def create_weight(self, distribution):
         list_distribution=distribution
         num = sum(list_distribution)

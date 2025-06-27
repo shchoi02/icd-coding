@@ -17,6 +17,7 @@ class PriorFocalModifierLoss(nn.Module):
         self.eps = eps
         self.distribution_path=distribution_path
         
+    @torch.no_grad()    
     def create_weight(self, distribution):
         list_distribution=distribution
         num = sum(list_distribution)
@@ -26,23 +27,24 @@ class PriorFocalModifierLoss(nn.Module):
         prob = prob / max_prob
         weight = pow(- prob.log() + 1, 1/3)
         self.weight=weight.cuda().detach()
-
+        
+    @torch.no_grad()    
     def create_co_occurrence_matrix(self, co_occurrence_matrix):
         co_occurrence_matrix=torch.tensor(co_occurrence_matrix).cuda()
         self.co_occurrence_matrix = co_occurrence_matrix / co_occurrence_matrix.sum(axis=0)
 
     def forward(self, x, y):       
-        weights = y.float() 
-        weights = weights / weights.sum(dim=1, keepdim=True).clamp(min=1e-12)
-        attention_scores = torch.matmul(weights, self.co_occurrence_matrix)
-        final_attention_scores = attention_scores / attention_scores.sum(dim=1, keepdim=True).clamp(min=1e-12) 
-        # attention_scores_total=[]
-        # for k in range(y.shape[0]): 
-        #     attention_scores=self.co_occurrence_matrix[y[k]==1].mean(dim=0)
-        #     attention_scores=attention_scores/attention_scores.sum()
-        #     attention_scores_total.append(attention_scores)
-        # final_attention_scores=torch.stack(attention_scores_total,0)
-        # print (final_attention_scores)
+        # weights = y.float() 
+        # weights = weights / weights.sum(dim=1, keepdim=True).clamp(min=1e-12)
+        # attention_scores = torch.matmul(weights, self.co_occurrence_matrix)
+        # final_attention_scores = attention_scores / attention_scores.sum(dim=1, keepdim=True).clamp(min=1e-12) 
+        attention_scores_total=[]
+        for k in range(y.shape[0]): 
+            attention_scores=self.co_occurrence_matrix[y[k]==1].mean(dim=0)
+            attention_scores=attention_scores/attention_scores.sum()
+            attention_scores_total.append(attention_scores)
+        final_attention_scores=torch.stack(attention_scores_total,0)
+        print (final_attention_scores)
         
         # postive -
         x_sigmoid = torch.pow(torch.sigmoid(x),1) 

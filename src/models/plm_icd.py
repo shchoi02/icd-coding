@@ -48,12 +48,12 @@ class PLMICD(nn.Module):
         )
         # self.loss = torch.nn.functional.binary_cross_entropy_with_logits
         
-        # self.loss = MultiGrainedFocalLoss()
-        # self.loss.create_weight(cls_num_list)
-        
-        self.loss = PriorFocalModifierLoss()
-        self.loss.create_co_occurrence_matrix(co_occurrence_matrix)
+        self.loss = MultiGrainedFocalLoss()
         self.loss.create_weight(cls_num_list)
+        
+        # self.loss = PriorFocalModifierLoss()
+        # self.loss.create_co_occurrence_matrix(co_occurrence_matrix)
+        # self.loss.create_weight(cls_num_list)
         
         # self.loss = ResampleLoss(
         #     use_sigmoid    = True,
