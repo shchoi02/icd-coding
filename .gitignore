@@ -138,3 +138,5 @@ files
 # wandb
 wandb
 outputs
+cls_num_list.txt
+co_occurrence_matrix.npy

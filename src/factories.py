@@ -35,10 +35,13 @@ def get_lookups(
 
 
 def get_model(
-    config: OmegaConf, data_info: dict, cls_num_list: Optional[list[int]] = None, text_encoder: Optional[Any] = None
+    config: OmegaConf, data_info: dict, cls_num_list: Optional[list[int]] = None, 
+    co_occurrence_matrix = None, text_encoder: Optional[Any] = None
 ) -> models.BaseModel:
     model_class = getattr(models, config.name)
-    return model_class(text_encoder=text_encoder, cls_num_list=cls_num_list, **data_info, **config.configs)
+    return model_class(text_encoder=text_encoder, 
+                       cls_num_list=cls_num_list, co_occurrence_matrix=co_occurrence_matrix,
+                       **data_info, **config.configs)
 
 
 def get_optimizer(config: OmegaConf, model: models.BaseModel) -> torch.optim.Optimizer:

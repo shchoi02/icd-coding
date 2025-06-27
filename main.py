@@ -1,7 +1,9 @@
 import logging
 import math
 import os
+import numpy as np
 from pathlib import Path
+
 
 import hydra
 import torch
@@ -50,6 +52,28 @@ def get_cls_num_list(
         counts[idxs] += 1
 
     return counts.tolist()
+
+
+def build_co_occurrence_matrix(
+    data,
+    label_transform,
+    split: str = "train",
+    *,
+    device: str | torch.device = "cuda",
+) -> np.ndarray:
+    samples = getattr(data, split)
+    C   = label_transform.num_classes
+    dev = torch.device(device)
+    counts = torch.zeros((C, C), dtype=torch.float32, device=dev)
+
+    with torch.no_grad():
+        for raw in _raw_targets_iter(samples):
+            idxs = label_transform.get_indices(raw).to(dev)
+            if idxs.numel():
+                counts[idxs[:, None], idxs] += 1.0 
+
+    probs = counts / (counts.sum(dim=0, keepdim=True) + 1e-8) 
+    return probs.cpu().numpy().astype(np.float32)
 
 
 def deterministic() -> None:
@@ -114,14 +138,25 @@ def main(cfg: OmegaConf) -> None:
         text_transform=text_transform,
     )
     
+    max_index = 0
+    for raw in _raw_targets_iter(data.train):
+        idxs = label_transform.get_indices(raw)
+        if len(idxs) > 0:
+            max_index = max(max_index, idxs.max().item())
+    print(f"Max label index: {max_index}, num_classes: {label_transform.num_classes}")
+    
     cls_num_list = get_cls_num_list(data, label_transform)
-    file_path = 'cls_num_list.txt'
-    with open(file_path, 'w') as file:
-        for item in cls_num_list:
-            file.write(str(item) + '\n')
+    # file_path = 'cls_num_list.txt'
+    # with open(file_path, 'w') as file:
+    #     for item in cls_num_list:
+    #         file.write(str(item) + '\n')
+    
+    co_occurrence_matrix = build_co_occurrence_matrix(data, label_transform)
+    np.save("co_occurrence_matrix.npy", co_occurrence_matrix)
 
     model = get_model(
-        config=cfg.model, data_info=lookups.data_info, text_encoder=text_encoder, cls_num_list=cls_num_list
+        config=cfg.model, data_info=lookups.data_info, text_encoder=text_encoder, 
+        cls_num_list=cls_num_list, co_occurrence_matrix=co_occurrence_matrix
     )
     model.to(device)
 
