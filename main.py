@@ -76,6 +76,27 @@ def build_co_occurrence_matrix(
     return probs.cpu().numpy().astype(np.float32)
 
 
+def compute_class_stats(
+    data,
+    label_transform,
+    split: str = "train",
+    *,
+    device: str | torch.device = "cuda",
+):
+    samples = getattr(data, split)
+    C   = label_transform.num_classes
+    dev = torch.device(device)
+
+    pos_freq = torch.zeros(C, dtype=torch.long, device=dev)
+    for raw in _raw_targets_iter(samples):
+        idxs = label_transform.get_indices(raw).to(dev)
+        pos_freq[idxs] += 1
+
+    total_samples = len(samples)
+    neg_freq = torch.full_like(pos_freq, total_samples) - pos_freq
+    return pos_freq.cpu(), neg_freq.cpu()
+
+
 def deterministic() -> None:
     """Run experiment deterministically. There will still be some randomness in the backward pass of the model."""
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
@@ -152,11 +173,14 @@ def main(cfg: OmegaConf) -> None:
     #         file.write(str(item) + '\n')
     
     co_occurrence_matrix = build_co_occurrence_matrix(data, label_transform)
-    np.save("co_occurrence_matrix.npy", co_occurrence_matrix)
+    # np.save("co_occurrence_matrix.npy", co_occurrence_matrix)
+    
+    class_freq, neg_class_freq = compute_class_stats(data, label_transform)
 
     model = get_model(
         config=cfg.model, data_info=lookups.data_info, text_encoder=text_encoder, 
-        cls_num_list=cls_num_list, co_occurrence_matrix=co_occurrence_matrix
+        cls_num_list=cls_num_list, co_occurrence_matrix=co_occurrence_matrix, 
+        class_freq=class_freq, neg_class_freq=neg_class_freq
     )
     model.to(device)
 

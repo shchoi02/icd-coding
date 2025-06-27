@@ -24,11 +24,15 @@ from transformers import RobertaModel, AutoConfig
 from src.models.modules.attention import LabelAttention
 from src.losses.mfm import MultiGrainedFocalLoss
 from src.losses.pfm import PriorFocalModifierLoss
+from src.losses.resample import ResampleLoss
+
 
 
 class PLMICD(nn.Module):
     def __init__(self, num_classes: int, model_path: str,
-                 cls_num_list: Optional[list[int]] = None, co_occurrence_matrix = None,
+                 cls_num_list: Optional[list[int]] = None, 
+                 co_occurrence_matrix = None,
+                 class_freq = None, neg_class_freq = None,
                  **kwargs):
         super().__init__()
         self.config = AutoConfig.from_pretrained(
@@ -50,6 +54,13 @@ class PLMICD(nn.Module):
         self.loss = PriorFocalModifierLoss()
         self.loss.create_co_occurrence_matrix(co_occurrence_matrix)
         self.loss.create_weight(cls_num_list)
+        
+        # self.loss = ResampleLoss(
+        #     use_sigmoid    = True,
+        #     class_freq     = class_freq,
+        #     neg_class_freq = neg_class_freq,
+        #     reweight_func  ='rebalance',      # 필요에 따라 변경
+        # )
 
     def get_loss(self, logits, targets):
         return self.loss(logits, targets)

@@ -36,11 +36,13 @@ def get_lookups(
 
 def get_model(
     config: OmegaConf, data_info: dict, cls_num_list: Optional[list[int]] = None, 
-    co_occurrence_matrix = None, text_encoder: Optional[Any] = None
+    co_occurrence_matrix = None, class_freq = None, neg_class_freq = None, 
+    text_encoder: Optional[Any] = None
 ) -> models.BaseModel:
     model_class = getattr(models, config.name)
     return model_class(text_encoder=text_encoder, 
                        cls_num_list=cls_num_list, co_occurrence_matrix=co_occurrence_matrix,
+                       class_freq=class_freq, neg_class_freq=neg_class_freq,
                        **data_info, **config.configs)
 
 
