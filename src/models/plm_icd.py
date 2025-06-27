@@ -46,7 +46,7 @@ class PLMICD(nn.Module):
             projection_size=self.config.hidden_size,
             num_classes=num_classes,
         )
-        self.loss = torch.nn.functional.binary_cross_entropy_with_logits
+        # self.loss = torch.nn.functional.binary_cross_entropy_with_logits
         
         # self.loss = MultiGrainedFocalLoss()
         # self.loss.create_weight(cls_num_list)
@@ -55,12 +55,12 @@ class PLMICD(nn.Module):
         # self.loss.create_co_occurrence_matrix(co_occurrence_matrix)
         # self.loss.create_weight(cls_num_list)
         
-        # self.loss = ResampleLoss(
-        #     use_sigmoid    = True,
-        #     class_freq     = class_freq,
-        #     neg_class_freq = neg_class_freq,
-        #     reweight_func  ='rebalance',      # 필요에 따라 변경
-        # )
+        self.loss = ResampleLoss(
+            use_sigmoid    = True,
+            class_freq     = class_freq,
+            neg_class_freq = neg_class_freq,
+            reweight_func  ='rebalance',      # 필요에 따라 변경
+        )
 
     def get_loss(self, logits, targets):
         return self.loss(logits, targets)
