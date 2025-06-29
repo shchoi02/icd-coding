@@ -2,7 +2,7 @@
   configs:
     project: automatic-medical-coding
     entity: null
-    # dir: /data/je
+    dir: /experiments
 - name: SaveBestModelCallback
   configs:
     split: val

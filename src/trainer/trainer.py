@@ -115,6 +115,7 @@ class Trainer:
                         self.lr_scheduler.step()
                 self.optimizer.zero_grad()
             self.update_metrics(output, "train")
+            # print(f"[Ep {epoch} | {batch_idx+1}/{num_batches}] " f"loss={loss:.4f}")
         self.on_train_end(epoch)
 
     def train_val(self, epoch, split_name: str = "train_val") -> None:

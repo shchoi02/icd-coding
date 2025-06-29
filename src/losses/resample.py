@@ -11,8 +11,7 @@ from sklearn.manifold import TSNE
 
 
 class ResampleLoss(nn.Module):
-    
-    # COCO-MLT
+
     def __init__(self,
                  use_sigmoid=False,
                  reduction='mean',
@@ -28,19 +27,17 @@ class ResampleLoss(nn.Module):
                      CB_mode='average_w'  # 'by_class', 'average_n', 'average_w', 'min_n'
                  ),
                  map_param=dict(
-                     alpha=0.1,
-                     beta=10,
-                     gamma=0.2
+                     alpha=10.0,
+                     beta=0.2,
+                     gamma=0.1
                  ),
                  logit_reg=dict(
-                     neg_scale=2.0,
-                     init_bias=0.05
+                     neg_scale=5.0,
+                     init_bias=0.1
                  ),
                  reweight_func=None,  # None, 'inv', 'sqrt_inv', 'rebalance', 'CB'
                  weight_norm=None, # None, 'by_instance', 'by_batch'
-                 class_freq=None,
-                 neg_class_freq=None
-                 ):
+                 class_freq=None, neg_class_freq=None):
         super(ResampleLoss, self).__init__()
 
         assert (use_sigmoid is True) or (partial is False)
@@ -75,9 +72,10 @@ class ResampleLoss(nn.Module):
         # CB loss params (optional)
         self.CB_beta = CB_loss['CB_beta']
         self.CB_mode = CB_loss['CB_mode']
-
-        self.class_freq = class_freq.cuda()
-        self.neg_class_freq = neg_class_freq.cuda()
+        
+        self.eps = 1e-8
+        self.class_freq = class_freq.clamp_min(self.eps)
+        self.neg_class_freq = neg_class_freq.clamp_min(self.eps)
         self.num_classes = self.class_freq.shape[0]
         self.train_num = self.class_freq[0] + self.neg_class_freq[0]
         # regularization params
@@ -196,4 +194,3 @@ class ResampleLoss(nn.Module):
             sum_ = torch.sum(weight * gt_labels, dim=1, keepdim=True)
             weight = sum_ / torch.sum(gt_labels, dim=1, keepdim=True)
         return weight
-    

@@ -61,19 +61,18 @@ def build_co_occurrence_matrix(
     *,
     device: str | torch.device = "cuda",
 ) -> np.ndarray:
-    samples = getattr(data, split)
-    C   = label_transform.num_classes
-    dev = torch.device(device)
-    counts = torch.zeros((C, C), dtype=torch.float32, device=dev)
 
+    samples = getattr(data, split)
+    C      = label_transform.num_classes
+    dev    = torch.device(device)
+    counts = torch.zeros((C, C), dtype=torch.float32, device=dev)
     with torch.no_grad():
         for raw in _raw_targets_iter(samples):
-            idxs = label_transform.get_indices(raw).to(dev)
-            if idxs.numel():
-                counts[idxs[:, None], idxs] += 1.0 
+            idxs = label_transform.get_indices(raw).to(dev) 
+            if idxs.numel():                                  
+                counts[idxs[:, None], idxs] += 1.0
 
-    probs = counts / (counts.sum(dim=0, keepdim=True) + 1e-8) 
-    return probs.cpu().numpy().astype(np.float32)
+    return counts.cpu().numpy().astype(np.float32)
 
 
 def compute_class_stats(
@@ -94,7 +93,7 @@ def compute_class_stats(
 
     total_samples = len(samples)
     neg_freq = torch.full_like(pos_freq, total_samples) - pos_freq
-    return pos_freq.cpu(), neg_freq.cpu()
+    return pos_freq, neg_freq
 
 
 def deterministic() -> None:
@@ -159,12 +158,15 @@ def main(cfg: OmegaConf) -> None:
         text_transform=text_transform,
     )
     
-    max_index = 0
-    for raw in _raw_targets_iter(data.train):
-        idxs = label_transform.get_indices(raw)
-        if len(idxs) > 0:
-            max_index = max(max_index, idxs.max().item())
-    print(f"Max label index: {max_index}, num_classes: {label_transform.num_classes}")
+    datasets = get_datasets(
+        config=cfg.dataset,
+        data=data,
+        text_transform=text_transform,
+        label_transform=label_transform,
+        lookups=lookups,
+    )
+
+    dataloaders = get_dataloaders(config=cfg.dataloader, datasets_dict=datasets)
     
     cls_num_list = get_cls_num_list(data, label_transform)
     # file_path = 'cls_num_list.txt'
@@ -176,6 +178,7 @@ def main(cfg: OmegaConf) -> None:
     # np.save("co_occurrence_matrix.npy", co_occurrence_matrix)
     
     class_freq, neg_class_freq = compute_class_stats(data, label_transform)
+    del data.df
 
     model = get_model(
         config=cfg.model, data_info=lookups.data_info, text_encoder=text_encoder, 
@@ -192,16 +195,8 @@ def main(cfg: OmegaConf) -> None:
         number_of_classes=lookups.data_info["num_classes"],
         code_system2code_indices=lookups.code_system2code_indices,
         split2code_indices=lookups.split2code_indices,
-    )
-    datasets = get_datasets(
-        config=cfg.dataset,
-        data=data,
-        text_transform=text_transform,
-        label_transform=label_transform,
-        lookups=lookups,
-    )
-
-    dataloaders = get_dataloaders(config=cfg.dataloader, datasets_dict=datasets)
+    ) 
+    
     optimizer = get_optimizer(config=cfg.optimizer, model=model)
     accumulate_grad_batches = int(
         max(cfg.dataloader.batch_size / cfg.dataloader.max_batch_size, 1)
@@ -210,6 +205,7 @@ def main(cfg: OmegaConf) -> None:
         math.ceil(len(dataloaders["train"]) / accumulate_grad_batches)
         * cfg.trainer.epochs
     )
+
     lr_scheduler = get_lr_scheduler(
         config=cfg.lr_scheduler,
         optimizer=optimizer,

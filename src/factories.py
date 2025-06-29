@@ -147,7 +147,7 @@ def get_datasets(
     train_data = data.train
     val_data = data.val
     test_data = data.test
-    del data.df
+    # del data.df
 
     datasets_dict["train"] = dataset_class(
         train_data,

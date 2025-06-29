@@ -30,7 +30,7 @@ from src.losses.resample import ResampleLoss
 
 class PLMICD(nn.Module):
     def __init__(self, num_classes: int, model_path: str,
-                 cls_num_list: Optional[list[int]] = None, 
+                 cls_num_list, 
                  co_occurrence_matrix = None,
                  class_freq = None, neg_class_freq = None,
                  **kwargs):
@@ -51,6 +51,8 @@ class PLMICD(nn.Module):
         # self.loss = MultiGrainedFocalLoss()
         # self.loss.create_weight(cls_num_list)
         
+        # print(cls_num_list)
+        
         # self.loss = PriorFocalModifierLoss()
         # self.loss.create_co_occurrence_matrix(co_occurrence_matrix)
         # self.loss.create_weight(cls_num_list)
@@ -59,7 +61,7 @@ class PLMICD(nn.Module):
             use_sigmoid    = True,
             class_freq     = class_freq,
             neg_class_freq = neg_class_freq,
-            reweight_func  ='rebalance',      # 필요에 따라 변경
+            reweight_func  ='rebalance',
         )
 
     def get_loss(self, logits, targets):

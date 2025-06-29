@@ -10,9 +10,9 @@ defaults:
   - override /callbacks: mean_average_precision
   
 
-dataloader:
+dataloader: 
   max_batch_size: 16
-  batch_size: 1
+  batch_size: 4
 
 optimizer:
   configs:
