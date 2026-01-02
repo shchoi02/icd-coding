@@ -1,137 +1,114 @@
 import torch
-import torch.nn as nn
-import numpy as np
 
-class EstimatorCV():
-    def __init__(self, feature_num, class_num):
-        super(EstimatorCV, self).__init__()
-        self.class_num = class_num
-        self.CoVariance = torch.zeros(class_num, feature_num, feature_num)
-        self.Ave        = torch.zeros(class_num, feature_num)
-        self.Amount     = torch.zeros(class_num)
-        self.Prop       = torch.zeros(class_num)
-        self.Cov_pos    = torch.zeros(class_num)
-        self.Cov_neg    = torch.zeros(class_num)
-        self.Sigma_cj   = torch.zeros(class_num, class_num)  # CPU
-        self.Ro_cj      = torch.zeros(class_num, class_num)  # CPU
-        self.Tao_cj     = torch.zeros(class_num, class_num)  # CPU
+class EstimatorCV:
+    """
+    ICD용:
+    - 전역 EMA로 유지 가능한 건 벡터(Prop/Cov_pos/Cov_neg/Amount)만 유지
+    - Sigma/Ro/Tao (Ca×Ca)는 배치 로컬로만 계산해서 반환 (절대 전역 저장 X)
+    """
+    def __init__(self, num_classes: int, eps: float = 1e-8):
+        self.num_classes = num_classes
+        self.eps = eps
 
-    # 기존 numpy -> torch 기반으로 교체
+        # ✅ 전역 상태는 CPU float32로 (메모리/안정성)
+        self.Amount  = torch.zeros(num_classes, dtype=torch.float32)  # 누적 pos count
+        self.Prop    = torch.zeros(num_classes, dtype=torch.float32)
+        self.Cov_pos = torch.zeros(num_classes, dtype=torch.float32)
+        self.Cov_neg = torch.zeros(num_classes, dtype=torch.float32)
+
     @torch.no_grad()
-    def update_CV(self, labels: torch.Tensor, logits: torch.Tensor):
+    def update(self, labels_ca: torch.Tensor, logits_ca: torch.Tensor, active_idx: torch.Tensor, device: torch.device):
         """
-        labels: [N, C] (0/1)
-        logits: [N, C]
-        returns: (Prop, Cov_pos, Cov_neg, Sigma_cj, Ro_cj, Tao_cj)
+        labels_ca/logits_ca: [B, Ca]
+        active_idx: [Ca] (원래 클래스 인덱스)
+        return:
+          prop_ca/cov_pos_ca/cov_neg_ca: [Ca] (GPU)
+          sigma/ro/tao: [Ca, Ca] (GPU)  -> 배치 로컬
         """
-        dev  = logits.device
-        eps  = 1e-8
+        eps = self.eps
+        B, Ca = labels_ca.shape
+        labels = labels_ca.to(torch.float32)
+        logits = logits_ca.to(torch.float32)
 
-        N, C = labels.shape
-        assert C == self.class_num
-        onehot = labels.to(logits.dtype)                # [N, C] on GPU
+        # ---- Prop (batch) ----
+        sum_pos = labels.sum(0)                       # [Ca]
+        prop = sum_pos / float(max(B, 1))            # [Ca]
 
-        # ---- 활성 클래스만 선택 ----
-        sum_pos  = onehot.sum(0)                        # [C]
-        act_mask = sum_pos > 0
-        if act_mask.sum() == 0:
-            # 이 배치에 양성 라벨이 없으면 갱신 없이 현 상태 반환
-            return (self.Prop.to(dev), self.Cov_pos.to(dev), self.Cov_neg.to(dev),
-                    self.Sigma_cj, self.Ro_cj, self.Tao_cj)
+        # ---- pos/neg variance (logits의 row_sum 기반이 아니라, "각 클래스 로짓 s_c" 기반이 더 안정적) ----
+        # CXR(원본)도 실제로 s_c 축 기반 통계를 쓰는 게 ICD에선 훨씬 낫습니다.
+        cov_pos = torch.zeros(Ca, device=device)
+        cov_neg = torch.zeros(Ca, device=device)
 
-        idx     = act_mask.nonzero(as_tuple=False).squeeze(1)   # [Ca] GPU indices
-        idx_cpu = idx.cpu()                                     # [Ca] CPU indices
-        Ca      = idx.numel()
+        for i in range(Ca):
+            pos = labels[:, i] > 0.5
+            neg = ~pos
+            s = logits[:, i]
+            if pos.sum() > 1:
+                cov_pos[i] = torch.var(s[pos], unbiased=False)
+            else:
+                cov_pos[i] = 0.0
+            if neg.sum() > 1:
+                cov_neg[i] = torch.var(s[neg], unbiased=False)
+            else:
+                cov_neg[i] = 0.0
 
-        M = onehot[:, idx]                                      # [N, Ca] (GPU)
+        cov_pos = torch.nan_to_num(cov_pos, nan=0.0, posinf=0.0, neginf=0.0)
+        cov_neg = torch.nan_to_num(cov_neg, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # ---- prior p(c) ----
-        pr_C_act = sum_pos[idx] / float(max(N, 1))              # [Ca] (GPU)
+        # ---- Sigma/Ro/Tao : Ca×Ca 배치 로컬 ----
+        # co-occurrence
+        M = labels  # [B, Ca]
+        Co = M.t() @ M  # [Ca, Ca]
 
-        # ---- 행 합/제곱합 (전체 로그릿 기준) ----
-        row_sum   = logits.sum(dim=1)                           # [N]
-        row_sumsq = (logits * logits).sum(dim=1)                # [N]
+        # sigma_cj: co-occur subset에서 "s_c" 분산 (원본의 result=logits[co,:]의 var(전체)보다 ICD에선 이게 훨씬 싸고 안정)
+        sigma = torch.zeros((Ca, Ca), device=device)
+        n_per = sum_pos.clamp_min(eps)  # [Ca]
 
-        # ---- 공발생 카운트 Co = M^T M ----
-        Co = M.t().mm(M)                                        # [Ca, Ca]
+        for c in range(Ca):
+            pos_c = M[:, c] > 0.5
+            s_c = logits[:, c]
+            for j in range(Ca):
+                co = pos_c & (M[:, j] > 0.5)
+                if co.sum() > 1:
+                    sigma[c, j] = torch.var(s_c[co], unbiased=False)
+                else:
+                    sigma[c, j] = 0.0
 
-        # ---- σ_cj: S_c∩S_j 에서의 전체 로그릿 분산 ----
-        # 공발생 가중 합/제곱합
-        S_sum   = M.t().mm(M * row_sum.view(N, 1))              # [Ca, Ca]
-        S_sumsq = M.t().mm(M * row_sumsq.view(N, 1))            # [Ca, Ca]
-        # 총 원소 수(샘플수×C)
-        Mtot = (Co * C).clamp_min(eps)                          # [Ca, Ca]
-        mean = S_sum / Mtot
-        var  = S_sumsq / Mtot - mean * mean                     # [Ca, Ca]
+        sigma = torch.nan_to_num(sigma, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # ---- ρ_cj, τ_cj ----
-        sum_pos_act = sum_pos[idx].clamp_min(eps)               # [Ca]
-        # ρ_cj = |c∩j| / |j|
-        Ro = Co / sum_pos_act.view(1, Ca)                       # [Ca, Ca]
-        # τ_cj = (N - |c|) / (|j| - |c∩j|)
-        denom = (sum_pos_act.view(1, Ca) - Co).clamp_min(eps)   # [Ca, Ca]
-        Tao   = (float(N) - sum_pos_act.view(Ca, 1)) / denom    # [Ca, Ca]
+        ro = Co / n_per.view(1, Ca)  # |c∧j| / |j|
+        denom = (n_per.view(1, Ca) - Co).clamp_min(eps)
+        tao = (float(B) - n_per.view(Ca, 1)) / denom
 
-        # ---- min–max 정규화 (활성 블록 기준) ----
-        def minmax_norm(x):
+        # minmax norm (배치 로컬)
+        def minmax(x):
             xmin = x.amin()
             xmax = x.amax()
             return (x - xmin) / (xmax - xmin + eps)
 
-        Sigma_n = minmax_norm(var)                               # [Ca, Ca]
-        Ro_n    = minmax_norm(Ro)                                # [Ca, Ca]
-        Tao_n   = minmax_norm(Tao)                               # [Ca, Ca]
+        sigma_n = minmax(sigma)
+        ro_n = minmax(ro)
+        tao_n = minmax(tao)
 
-        # ---- per-class pos/neg 분산 (전체 로그릿 매트릭스에 대한 분산) ----
-        # pos: S_c, neg: ¬S_c
-        S_pos   = (row_sum.view(N, 1)   * M).sum(dim=0)          # [Ca]
-        S2_pos  = (row_sumsq.view(N, 1) * M).sum(dim=0)          # [Ca]
-        M_pos   = (sum_pos_act * C).clamp_min(eps)               # [Ca]
-        mean_p  = S_pos / M_pos
-        var_pos = S2_pos / M_pos - mean_p * mean_p               # [Ca]
+        # ---- 전역 EMA 업데이트 (CPU) : active_idx 위치만 sparse update ----
+        idx_cpu = active_idx.detach().cpu()
+        amount_act = self.Amount[idx_cpu].to(device=device)
 
-        Mneg        = 1.0 - M
-        cnt_neg     = (float(N) - sum_pos_act).clamp_min(eps)    # [Ca]
-        S_neg       = (row_sum.view(N, 1)   * Mneg).sum(dim=0)   # [Ca]
-        S2_neg      = (row_sumsq.view(N, 1) * Mneg).sum(dim=0)   # [Ca]
-        M_neg_total = (cnt_neg * C).clamp_min(eps)               # [Ca]
-        mean_n      = S_neg / M_neg_total
-        var_neg     = S2_neg / M_neg_total - mean_n * mean_n     # [Ca]
+        w_pr = sum_pos / (sum_pos + amount_act + eps)  # [Ca]
+        w_pr_cpu = w_pr.detach().cpu()
 
-        # ---- EMA 가중치 (상태는 CPU, 계산은 GPU) ----
-        amount_act_cpu = self.Amount[idx_cpu]                    # [Ca] CPU
-        amount_act     = amount_act_cpu.to(dev)                  # [Ca] GPU
+        self.Prop[idx_cpu] = self.Prop[idx_cpu] * (1 - w_pr_cpu) + prop.detach().cpu() * w_pr_cpu
+        self.Cov_pos[idx_cpu] = self.Cov_pos[idx_cpu] * (1 - w_pr_cpu) + cov_pos.detach().cpu() * w_pr_cpu
 
-        w_pr     = sum_pos_act / (sum_pos_act + amount_act + eps)   # [Ca] GPU
-        w_pr_neg = cnt_neg    / (cnt_neg    + amount_act + eps)     # [Ca] GPU
-        w_cj     = Co / (Co + amount_act.view(Ca, 1) + eps)         # [Ca, Ca] GPU
+        # neg는 (B - pos) 기반 weight
+        cnt_neg = (float(B) - sum_pos).clamp_min(eps)
+        w_pr_neg = cnt_neg / (cnt_neg + amount_act + eps)
+        w_pr_neg_cpu = w_pr_neg.detach().cpu()
+        self.Cov_neg[idx_cpu] = self.Cov_neg[idx_cpu] * (1 - w_pr_neg_cpu) + cov_neg.detach().cpu() * w_pr_neg_cpu
 
-        # ---- 스칼라 상태 갱신 (CPU 인덱싱) ----
-        w_pr_cpu     = w_pr.detach().to(self.Prop.dtype).cpu()
-        w_pr_neg_cpu = w_pr_neg.detach().to(self.Prop.dtype).cpu()
+        self.Amount[idx_cpu] += sum_pos.detach().cpu()
 
-        self.Prop[idx_cpu]    = (self.Prop[idx_cpu]    * (1 - w_pr_cpu)     + pr_C_act.detach().cpu() * w_pr_cpu)
-        self.Cov_pos[idx_cpu] = (self.Cov_pos[idx_cpu] * (1 - w_pr_cpu)     + var_pos.detach().cpu()  * w_pr_cpu)
-        self.Cov_neg[idx_cpu] = (self.Cov_neg[idx_cpu] * (1 - w_pr_neg_cpu) + var_neg.detach().cpu()  * w_pr_neg_cpu)
-        self.Amount[idx_cpu]  = self.Amount[idx_cpu] + sum_pos_act.detach().cpu()
-
-        # ---- 행렬 상태 갱신 (CPU 인덱싱) ----
-        ii_cpu, jj_cpu = torch.meshgrid(idx_cpu, idx_cpu, indexing='ij')
-
-        Sigma_n_cpu = Sigma_n.detach().to(self.Sigma_cj.dtype).cpu()
-        Ro_n_cpu    = Ro_n.detach().to(self.Ro_cj.dtype).cpu()
-        Tao_n_cpu   = Tao_n.detach().to(self.Tao_cj.dtype).cpu()
-        w_cj_cpu    = w_cj.detach().to(Sigma_n_cpu.dtype).cpu()
-
-        self.Sigma_cj[ii_cpu, jj_cpu] = self.Sigma_cj[ii_cpu, jj_cpu] * (1 - w_cj_cpu) + Sigma_n_cpu * w_cj_cpu
-        self.Ro_cj[ii_cpu, jj_cpu]    = self.Ro_cj[ii_cpu, jj_cpu]    * (1 - w_cj_cpu) + Ro_n_cpu    * w_cj_cpu
-        self.Tao_cj[ii_cpu, jj_cpu]   = self.Tao_cj[ii_cpu, jj_cpu]   * (1 - w_cj_cpu) + Tao_n_cpu   * w_cj_cpu
-
-        # ---- 반환 (2D 통계는 GPU, C×C 행렬은 CPU 유지) ----
-        return (self.Prop.detach().to(dev),
-                self.Cov_pos.detach().to(dev),
-                self.Cov_neg.detach().to(dev),
-                self.Sigma_cj.detach().cpu(),
-                self.Ro_cj.detach().cpu(),
-                self.Tao_cj.detach().cpu())
-
+        return (
+            prop.detach(), cov_pos.detach(), cov_neg.detach(),
+            sigma_n.detach(), ro_n.detach(), tao_n.detach()
+        )

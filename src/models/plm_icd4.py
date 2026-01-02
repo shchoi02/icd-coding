@@ -14,17 +14,57 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """PyTorch RoBERTa model. """
-import torch, math
+import torch, math, copy
 import torch.utils.checkpoint
 from torch import nn
 from typing import Optional
 
 from transformers import RobertaModel, AutoConfig
 
-from src.models.modules.attention import LabelAttention2
+from src.models.modules.attention import LabelAttention
 import torch.nn.functional as F
 from src.losses.mfm import MultiGrainedFocalLoss
 
+
+class LabelAttentionWithAux(LabelAttention):
+    """
+    원래 LabelAttention 로직을 그대로 쓰되,
+    - attention_mask_1d (B,L) 마스킹 지원
+    - return_aux=True면 embed_mean (B,H) 반환
+    """
+    def forward(self, x: torch.Tensor, attention_mask_1d: Optional[torch.Tensor]=None, return_aux: bool=False):
+        # x: [B,L,H]
+        weights = torch.tanh(self.first_linear(x))              # [B,L,P]
+        att_logits = self.second_linear(weights)                # [B,L,C]
+
+        if attention_mask_1d is not None:
+            # mask: 1 for valid, 0 for pad
+            mask = attention_mask_1d.unsqueeze(-1).to(att_logits.dtype)  # [B,L,1]
+            # pad 위치를 -inf로
+            att_logits = att_logits.masked_fill(mask.eq(0), float("-inf"))
+
+        att_weights = F.softmax(att_logits, dim=1).transpose(1, 2)       # [B,C,L]
+        weighted_output = att_weights @ x                                 # [B,C,H]
+
+        logits = (
+            self.third_linear.weight.mul(weighted_output)
+            .sum(dim=2)
+            .add(self.third_linear.bias)
+        )  # [B,C]
+
+        if not return_aux:
+            return logits
+
+        # COMIC 코드에서 필요했던 f_* (B,H)를 만들어줘야 함
+        # 가장 무난한 정의: class-wise weighted_output을 class 평균낸 벡터
+        embed_mean = weighted_output.mean(dim=1)  # [B,H]
+
+        aux = {
+            "embed_mean": embed_mean,          # [B,H]
+            "weighted_output": weighted_output # [B,C,H] (디버깅/확장용)
+        }
+        return logits, aux
+    
 # =========================================================
 # masked_softmax
 # - COMIC Eq8에서 q=1, k=2 고정이면 padding 개념이 없으니
@@ -217,7 +257,39 @@ class HeadTailBalancerLoss(nn.Module):
 
         loss = (k_h * loss_h + k_t * loss_t).mean()
         return loss
-    
+
+
+class HeadTailBalancerLoss2(nn.Module):
+    def __init__(self, alpha=2.0, T=1.0, eps=1e-8):
+        super().__init__()
+        self.alpha = alpha   # 논문 식의 alpha (차이 강조)
+        self.T = T           # distill temperature (선택)
+        self.eps = eps
+
+    def forward(self, z_h_hat, z_t_hat, z_b):
+        # teacher soft targets (detach)
+        p_h = torch.sigmoid(z_h_hat / self.T).detach()
+        p_t = torch.sigmoid(z_t_hat / self.T).detach()
+
+        # student probs
+        p_b = torch.sigmoid(z_b / self.T)
+
+        # teacher-student soft BCE (multilabel)
+        # (T^2 스케일은 KL에서 자주 쓰는 보정인데, soft-BCE에서는 선택 사항)
+        with torch.cuda.amp.autocast(enabled=False):
+            loss_h = F.binary_cross_entropy(p_b.float(), p_h.float(), reduction="none").mean(dim=1)
+            loss_t = F.binary_cross_entropy(p_b.float(), p_t.float(), reduction="none").mean(dim=1)
+
+        # adaptive weights kappa (더 틀리는 쪽에 가중치↑)
+        with torch.no_grad():
+            lh = (loss_h + self.eps).pow(self.alpha)
+            lt = (loss_t + self.eps).pow(self.alpha)
+            denom = lh + lt + self.eps
+            k_h = lh / denom
+            k_t = lt / denom
+
+        return (k_h * loss_h + k_t * loss_t).mean()
+ 
 
 class PLMICD4(nn.Module):
     def __init__(self, num_classes: int, model_path: str,
@@ -230,52 +302,44 @@ class PLMICD4(nn.Module):
         self.config = AutoConfig.from_pretrained(
             model_path, num_labels=num_classes, finetuning_task=None
         )
-        
-        self.roberta = RobertaModel(
-            self.config, add_pooling_layer=False
-        ).from_pretrained(model_path, config=self.config)
-        
-        self.attention = LabelAttention2(
-            input_size=self.config.hidden_size,
-            projection_size=self.config.hidden_size,
-            num_classes=num_classes,
-        )
+        self.register_buffer("head_idx", torch.tensor(head_idx))
+        self.register_buffer("tail_idx", torch.tensor(tail_idx))
+        self.num_classes = num_classes
         
         H = self.config.hidden_size
-        self.cls_bal = BalancedCausalNormClassifier(num_classes, self.config.hidden_size)
-        self.cls_head = HeadCausalNormClassifier(num_classes, self.config.hidden_size)
-        self.cls_tail = TailCausalNormClassifier(num_classes, self.config.hidden_size)
+        self.roberta = RobertaModel(self.config, add_pooling_layer=False).from_pretrained(model_path, config=self.config)
+        
+        self.roberta.gradient_checkpointing_enable()
 
-        self.env_attn = AdditiveEnvAttention(dim=self.config.hidden_size)
+        self.attn_h = LabelAttentionWithAux(input_size=H, projection_size=H, num_classes=len(head_idx))
+        self.attn_t = LabelAttentionWithAux(input_size=H, projection_size=H, num_classes=len(tail_idx))
+        self.attn_b = LabelAttentionWithAux(input_size=H, projection_size=H, num_classes=num_classes)
+      
+        self.cls_bal = BalancedCausalNormClassifier(num_classes, self.config.hidden_size)
+        self.cls_head = HeadCausalNormClassifier(len(head_idx), self.config.hidden_size)
+        self.cls_tail = TailCausalNormClassifier(len(tail_idx), self.config.hidden_size)
+
+        self.env_attn = AdditiveEnvAttention(dim=H, num_hiddens=H, dropout=0.1, attn_scale=0.1)
         
         self.loss = MultiGrainedFocalLoss()
         self.loss.create_weight(cls_num_list)
         self.htb_loss = HeadTailBalancerLoss()
         self.htb_loss.PFM = self.loss
         self.mu = 0.9
-        self.register_buffer("e_t", torch.zeros(H), persistent=True)
+        self.register_buffer("et_b", torch.zeros(H), persistent=True)
+        self.register_buffer("et_h", torch.zeros(H), persistent=True)
+        self.register_buffer("et_t", torch.zeros(H), persistent=True)
         self.lambda_htb = 0.2
-        
-    
-    # 3) training_step에서 loss 계산 "후" e_t 갱신
-    def _update_e_t_from_embed_mean(self, loss, embed_mean):
-        # embed_mean: [B, H] (LabelAttention2 aux["embed_mean"])
-        # g_t = d loss / d embed_mean
-        g = torch.autograd.grad(
-            outputs=loss,
-            inputs=embed_mean,
-            retain_graph=True,   # 이후 backward를 또 할 거면 True
-            create_graph=False,
-            allow_unused=False
-        )[0]  # [B, H]
 
-        # Eq7의 sum g_t
-        g_sum = g.detach().sum(dim=0)  # [H]
-    
-        # momentum update
-        self.e_t.mul_(self.mu).add_(g_sum)
-        self.e_t.div_(self.e_t.norm(p=2).clamp_min(1e-12))
-
+    def _scatter(self, part_logits: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+        """
+        part_logits: (B, |idx|)
+        return:      (B, C) with values placed at idx, others 0
+        """
+        B = part_logits.size(0)
+        full = part_logits.new_zeros(B, self.num_classes)
+        full.index_copy_(1, idx, part_logits)
+        return full
         
     def get_loss(self, logits, targets, z_h=None, z_t=None):
         loss_main = self.loss(logits, targets)
@@ -289,10 +353,12 @@ class PLMICD4(nn.Module):
     def training_step(self, batch) -> dict[str, torch.Tensor]:
         data, targets, attention_mask = batch.data, batch.targets, batch.attention_mask
         out = self.forward(data, attention_mask, return_all=True)
-        z_b, z_h, z_t = out["z_b"], out["z_h"], out["z_t"]
-        embed_mean = out["embed_mean"]
-        loss = self.get_loss(z_b, targets, z_h, z_t)
-        self._update_e_t_from_embed_mean(loss, embed_mean)
+        z_b, z_h_hat, z_t_hat = out["z_b"], out["z_h_nm"], out["z_t_nm"]
+        loss = self.get_loss(z_b, targets, z_h_hat, z_t_hat)
+        with torch.no_grad():
+            self.et_b.mul_(self.mu).add_((1.0 - self.mu) * out["embed_mean_b"].detach().mean(0))
+            self.et_h.mul_(self.mu).add_((1.0 - self.mu) * out["embed_mean_h"].detach().mean(0))
+            self.et_t.mul_(self.mu).add_((1.0 - self.mu) * out["embed_mean_t"].detach().mean(0))
         probs = torch.sigmoid(z_b).detach()
         return {"logits": probs, "loss": loss, "targets": targets}
 
@@ -316,32 +382,31 @@ class PLMICD4(nn.Module):
         """
                 
         batch_size, num_chunks, chunk_size = input_ids.size()
-        with torch.cuda.amp.autocast(enabled=False):
-            outputs = self.roberta(
-                input_ids.view(-1, chunk_size),
-                attention_mask=attention_mask.view(-1, chunk_size)
-                if attention_mask is not None
-                else None,
-                return_dict=False,
-            )
-        hidden_output = outputs[0].view(batch_size, num_chunks * chunk_size, -1)
-        # logits = self.attention(hidden_output)  
+        mask2d = attention_mask.view(-1, chunk_size) if attention_mask is not None else None
+        mask1d = attention_mask.view(batch_size, -1)  if attention_mask is not None else None
         
-        mask1d = attention_mask.view(batch_size, -1) if attention_mask is not None else None
+        out = self.roberta(
+            input_ids.view(-1, chunk_size),
+            attention_mask=mask2d,
+            return_dict=False,
+        )
+        hidden = out[0].view(batch_size, num_chunks * chunk_size, -1)  # [B, L, H]
         
-        # (1) LAAT logits + embed_mean (최소 수정 포인트)
-        laat_logits, aux = self.attention(hidden_output, attention_mask_1d=mask1d, return_aux=True)
-        embed_mean = aux["embed_mean"]  # [B,H]  <- "embed mean 제대로" 여기서 보장
-
-        # (2) COMIC classifier 경로 (현재 head/tail backbone이 없으니 임시로 동일 feature 사용)
-        f_hat_b = embed_mean
-        f_h = embed_mean
-        f_t = embed_mean
+        laat_h, aux_h = self.attn_h(hidden, attention_mask_1d=mask1d, return_aux=True)
+        laat_t, aux_t = self.attn_t(hidden, attention_mask_1d=mask1d, return_aux=True)
+        laat_b, aux_b = self.attn_b(hidden, attention_mask_1d=mask1d, return_aux=True)
+ 
+        f_h, f_t, f_hat_b = aux_h["embed_mean"], aux_t["embed_mean"], aux_b["embed_mean"]
         f_b = self.env_attn(f_hat_b, f_h, f_t)
 
-        z_h, z_h_nm = self.cls_head(f_h, self.e_t)  # embed: [H] 형태로 넣고 싶으면 평균 등으로 축약
-        z_t, z_t_nm = self.cls_tail(f_t, self.e_t)
-        z_b, z_b_nm = self.cls_bal(f_b, None)
+        z_h, z_h_nm = self.cls_head(f_h, self.et_h)
+        z_t, z_t_nm = self.cls_tail(f_t, self.et_t)
+        z_b, z_b_nm = self.cls_bal(f_b, self.et_b)
+        
+        z_h = self._scatter(z_h, self.head_idx)
+        z_t = self._scatter(z_t, self.tail_idx)
+        z_h_nm = self._scatter(z_h_nm, self.head_idx)
+        z_t_nm = self._scatter(z_t_nm, self.tail_idx)
 
         if not return_all:
             return z_b  # 기본 반환은 balanced logits로 유지
@@ -349,7 +414,7 @@ class PLMICD4(nn.Module):
         return {
             "z_b": z_b, "z_h": z_h, "z_t": z_t,
             "z_b_nm": z_b_nm, "z_h_nm": z_h_nm, "z_t_nm": z_t_nm,
-            "laat_logits": laat_logits,   # 원래 LAAT logits도 남겨둠(디버깅/ablation용)
-            "embed_mean": embed_mean,
+            "embed_mean_b": f_hat_b, "embed_mean_h": f_h, "embed_mean_t": f_t,
+            "laat_logits_b": laat_b, "laat_logits_h": laat_h, "laat_logits_t": laat_t,
         }
     

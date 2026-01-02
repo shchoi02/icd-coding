@@ -4,7 +4,185 @@ import torch.nn.functional as F
 from src.losses.utils import weight_reduce_loss
 from src.losses.ce import binary_cross_entropy, cross_entropy, partial_cross_entropy
 import numpy as np
+from src.losses.mfm import MultiGrainedFocalLoss
 
+  
+    
+class ResampleLoss2(nn.Module):
+    """
+    ICD용 수정 포인트:
+        - SLP는 전체 C가 아니라 active subset(Ca)에서만 수행
+        - logits/labels/prop/var/sigma/ro/tao는 모두 (Ca) 기준으로 들어온다고 가정
+    """
+    def __init__(
+        self,
+        class_instance_nums,
+        up_mult=9, dw_mult=9,
+        coef_alpha=1.0/3.0, coef_beta=0.7,
+        use_slp=True,
+        return_slp_debug=True,
+        eps=1e-8,
+        reduction="mean",
+    ):
+        super().__init__()
+        self.use_slp = use_slp
+        self.return_slp_debug = return_slp_debug
+        self.up_mult = up_mult
+        self.dw_mult = dw_mult
+        self.coef_alpha = coef_alpha
+        self.coef_beta = coef_beta
+        self.eps = eps
+        self.reduction = reduction
+
+        class_freq = torch.tensor(class_instance_nums, dtype=torch.float32)
+        self.register_buffer("class_freq", class_freq.clamp_min(1.0))
+
+        # 원본 MFM 사용 (외부에서 주입해도 됨)
+        self.mfm = MultiGrainedFocalLoss()
+        self.mfm.create_weight(class_instance_nums)
+
+    def forward(
+        self,
+        norm_prop, nonzero_var_tensor, zero_var_tensor,
+        normalized_sigma_cj, normalized_ro_cj, normalized_tao_cj,
+        cls_score, label,
+        active_idx=None,
+        return_slp_debug=False,
+        **kwargs,
+    ):
+        """
+        cls_score: [B, C_total] 또는 [B, Ca]
+        label:     [B, C_total] 또는 [B, Ca]
+        active_idx: ICD에서는 [Ca] (LongTensor) 주는 것을 권장
+        """
+        logits_raw_full = cls_score
+        targets_full = label.float()
+
+        if active_idx is not None:
+            # (ICD) active subset으로 축소
+            logits_raw = logits_raw_full.index_select(dim=1, index=active_idx)
+            targets = targets_full.index_select(dim=1, index=active_idx)
+        else:
+            # (CXR) 그냥 전체 사용 (C가 작을 때만)
+            logits_raw = logits_raw_full
+            targets = targets_full
+
+        if self.use_slp:
+            logits_slp, dbg = self._apply_slp_subset(
+                logits_raw, targets,
+                norm_prop, nonzero_var_tensor, zero_var_tensor,
+                normalized_sigma_cj, normalized_ro_cj, normalized_tao_cj,
+                return_debug=True,
+            )
+        else:
+            logits_slp = logits_raw
+            dbg = {}
+
+        loss = self.mfm(logits_slp, targets)
+
+        if return_slp_debug or self.return_slp_debug:
+            return loss, logits_raw.detach(), logits_slp.detach(), dbg
+        return loss
+
+    def _apply_slp_subset(
+        self,
+        logits_ca, labels_ca,
+        prop_ca, nonzero_var_ca, zero_var_ca,
+        sigma_ca, ro_ca, tao_ca,
+        return_debug=False,
+    ):
+        """
+        logits_ca:  [B, Ca]
+        labels_ca:  [B, Ca]
+        sigma/ro/tao: [Ca, Ca]
+        """
+        B, Ca = logits_ca.shape
+
+        # 여기서만 [B, Ca, Ca]를 만듦. Ca는 수백~수천으로 제한해야 함.
+        logits_exp = logits_ca.unsqueeze(-1).expand(B, Ca, Ca).clone()
+        labels_exp = labels_ca.unsqueeze(-1).expand(B, Ca, Ca).clone()
+
+        perturb, dbg_dict = self._lpl_imbalance(
+            logits_exp, labels_exp,
+            prop_ca, nonzero_var_ca, zero_var_ca,
+            sigma_ca, ro_ca, tao_ca,
+            return_debug=True,
+        )
+        logits_slp = (logits_exp + perturb).mean(dim=2)  # [B, Ca]
+
+        if return_debug:
+            return logits_slp, dbg_dict
+        return logits_slp
+
+    def _pgd_like_diff_sign(self, x, y, step, sign):
+        y = y.to(torch.float32)
+        iters = int(torch.max(step).item() + 1)
+        logit = torch.zeros_like(x)
+        for k in range(iters):
+            grad = torch.sigmoid(x) - y
+            x = x + grad * sign / x.shape[1]
+            logit = logit + x * (step == k)
+        return logit
+
+    def _lpl_imbalance(
+        self, logits, labels,
+        prop, nonzero_var_tensor, zero_var_tensor,
+        normalized_sigma_cj, normalized_ro_cj, normalized_tao_cj,
+        return_debug=False,
+    ):
+        """
+        logits, labels: [B, Ca, Ca]
+        coef_cj: [Ca, Ca]
+        """
+        Ca = labels.size(1)
+        eps = 1e-6
+
+        safe_zero = torch.clamp(zero_var_tensor, min=eps)
+        ratio = nonzero_var_tensor / safe_zero  # [Ca]
+
+        lam  = self.coef_alpha
+        beta = self.coef_beta
+
+        coef_cc = (1.0 - (1.0 - lam) * beta) * prop + (1.0 - lam) * beta * ratio  # [Ca]
+        coef_cj = lam * normalized_tao_cj + (1.0 - lam) * (beta * normalized_sigma_cj + (1.0 - beta) * normalized_ro_cj)  # [Ca,Ca]
+
+        eye = torch.eye(Ca, device=logits.device, dtype=coef_cj.dtype)
+        coef_cj = coef_cj * (1.0 - eye) + torch.diag(coef_cc)
+
+        quant = coef_cj.mean()
+        head_mask = (coef_cj > quant).to(coef_cj.dtype)
+        tail_mask = 1.0 - head_mask
+
+        def _group_minmax(x, mask):
+            x_masked = x * mask
+            if (mask > 0).sum() == 0:
+                return x_masked
+            valid = x_masked[mask > 0]
+            v_min = valid.min()
+            v_max = valid.max()
+            scale = (v_max - v_min + eps)
+            x_norm = (x_masked - v_min) / scale
+            return torch.clamp(x_norm, min=0.0)
+
+        head_coef = _group_minmax(coef_cj, head_mask)
+        tail_coef = _group_minmax(coef_cj, tail_mask)
+
+        head_dw_steps = torch.floor(head_coef * self.dw_mult)
+        tail_up_steps = torch.floor(tail_coef * self.up_mult)
+
+        logits_head_dw = self._pgd_like_diff_sign(logits, labels, head_dw_steps, -1.0) - logits
+        logits_tail_up = self._pgd_like_diff_sign(logits, labels, tail_up_steps,  1.0) - logits
+
+        perturb = (logits_head_dw + logits_tail_up).detach()
+
+        if return_debug:
+            return perturb, {
+                "coef_cj": coef_cj.detach(),
+                "head_dw_steps": head_dw_steps.detach(),
+                "tail_up_steps": tail_up_steps.detach(),
+            }
+        return perturb
+    
 
 class ResampleLoss(nn.Module):
 

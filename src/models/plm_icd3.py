@@ -24,7 +24,7 @@ from transformers import RobertaModel, AutoConfig
 from src.models.modules.attention import LabelAttention
 
 from src.losses.estimator import EstimatorCV
-from src.losses.resample2 import ResampleLoss
+from src.losses.resample2 import ResampleLoss2
 
 
 
@@ -50,13 +50,13 @@ class PLMICD3(nn.Module):
             num_classes=num_classes,
         )
         
-        self.estimator = EstimatorCV(self.config.hidden_size, num_classes) # 추가
+        self.estimator = EstimatorCV(num_classes=num_classes) # 추가
             
         # self.loss = torch.nn.functional.binary_cross_entropy_with_logits
-        self.slploss = ResampleLoss(
-            use_sigmoid=True,
-            class_freq=class_freq,           
-            neg_class_freq=neg_class_freq,
+        self.slploss = ResampleLoss2(
+            class_instance_nums=cls_num_list,
+            use_slp=True,
+            return_slp_debug=True,   # 필요 시 True
         )
 
     def get_loss(self, logits, targets):
@@ -64,46 +64,35 @@ class PLMICD3(nn.Module):
 
     def training_step(self, batch) -> dict[str, torch.Tensor]:
         data, targets, attention_mask = batch.data, batch.targets, batch.attention_mask
-        logits = self(data, attention_mask) # 변경
+        logits_full = self(data, attention_mask)
+        
+        active_idx = self.build_active_idx(targets, K_neg=2048)  # <- 메모리 맞춰 조절
+        logits_ca = logits_full.index_select(1, active_idx)
+        labels_ca = targets.index_select(1, active_idx)
+        
         with torch.no_grad():
-            Prop, Cov_pos, Cov_neg, Sigma_cj, Ro_cj, Tao_cj = self.estimator.update_CV(targets, logits)
+            prop_ca, cov_pos_ca, cov_neg_ca, sigma_ca, ro_ca, tao_ca = \
+                self.estimator.update(labels_ca, logits_ca, active_idx=active_idx, device=logits_full.device)
+        
         loss = self.slploss(
-                    norm_prop=Prop,
-                    nonzero_var_tensor=Cov_pos,
-                    zero_var_tensor=Cov_neg,
-                    normalized_sigma_cj=Sigma_cj,
-                    normalized_ro_cj=Ro_cj,
-                    normalized_tao_cj=Tao_cj,
-                    cls_score=logits,
-                    label=targets
-                )
-        logits = torch.sigmoid(logits)
+            norm_prop=prop_ca,
+            nonzero_var_tensor=cov_pos_ca,
+            zero_var_tensor=cov_neg_ca,
+            normalized_sigma_cj=sigma_ca,
+            normalized_ro_cj=ro_ca,
+            normalized_tao_cj=tao_ca,
+            cls_score=logits_ca,
+            label=labels_ca,
+        )
+        
+        logits = torch.sigmoid(logits_full)
         return {"logits": logits, "loss": loss, "targets": targets}
 
 
     def validation_step(self, batch) -> dict[str, torch.Tensor]:
         data, targets, attention_mask = batch.data, batch.targets, batch.attention_mask
         logits = self(data, attention_mask)
-        dev = logits.device
-        
-        with torch.no_grad():
-            Prop    = self.estimator.Prop.to(dev)
-            Cov_pos = self.estimator.Cov_pos.to(dev)
-            Cov_neg = self.estimator.Cov_neg.to(dev)
-            Sigma_cj = self.estimator.Sigma_cj
-            Ro_cj = self.estimator.Ro_cj
-            Tao_cj = self.estimator.Tao_cj
-
-        loss = self.slploss(
-            norm_prop=Prop,
-            nonzero_var_tensor=Cov_pos,
-            zero_var_tensor=Cov_neg,
-            normalized_sigma_cj=Sigma_cj,
-            normalized_ro_cj=Ro_cj,
-            normalized_tao_cj=Tao_cj,
-            cls_score=logits,
-            label=targets
-        )
+        loss = self.slploss.mfm(logits, targets.float())
         logits = torch.sigmoid(logits)
         return {"logits": logits, "loss": loss, "targets": targets}
 
@@ -129,3 +118,25 @@ class PLMICD3(nn.Module):
         hidden_output = outputs[0].view(batch_size, num_chunks * chunk_size, -1)
         logits = self.attention(hidden_output)
         return logits
+    
+    @staticmethod
+    @torch.no_grad()
+    def build_active_idx(labels: torch.Tensor, K_neg: int = 512):
+        """
+        labels: [B, C_total] (0/1)
+        return: active_idx [Ca] (pos union sampled neg)
+        """
+        dev = labels.device
+        pos_mask = labels.any(dim=0)                      # [C_total]
+        pos_idx = pos_mask.nonzero(as_tuple=False).squeeze(1)
+
+        neg_pool = (~pos_mask).nonzero(as_tuple=False).squeeze(1)
+        if neg_pool.numel() > 0 and K_neg > 0:
+            k = min(K_neg, neg_pool.numel())
+            perm = torch.randperm(neg_pool.numel(), device=dev)[:k]
+            neg_idx = neg_pool[perm]
+            active_idx = torch.unique(torch.cat([pos_idx, neg_idx], dim=0))
+        else:
+            active_idx = pos_idx
+
+        return active_idx

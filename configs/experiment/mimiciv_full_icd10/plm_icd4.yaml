@@ -7,11 +7,11 @@ defaults:
   - override /dataset: huggingface
   - override /text_transform: huggingface
   - override /optimizer: adamw
-  - override /callbacks: auc_macro
+  - override /callbacks: mean_average_precision
   
 
 dataloader: 
-  max_batch_size: 2
+  max_batch_size: 4
   batch_size: 16
 
 optimizer:
