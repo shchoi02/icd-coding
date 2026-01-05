@@ -23,7 +23,7 @@ from transformers import RobertaModel, AutoConfig
 
 from src.models.modules.attention import LabelAttention
 import torch.nn.functional as F
-from src.losses.mfm import MultiGrainedFocalLoss
+from src.losses.asl import ASLwithClassWeight
 
 
 class LabelAttentionWithAux(LabelAttention):
@@ -259,38 +259,6 @@ class HeadTailBalancerLoss(nn.Module):
         return loss
 
 
-class HeadTailBalancerLoss2(nn.Module):
-    def __init__(self, alpha=2.0, T=1.0, eps=1e-8):
-        super().__init__()
-        self.alpha = alpha   # 논문 식의 alpha (차이 강조)
-        self.T = T           # distill temperature (선택)
-        self.eps = eps
-
-    def forward(self, z_h_hat, z_t_hat, z_b):
-        # teacher soft targets (detach)
-        p_h = torch.sigmoid(z_h_hat / self.T).detach()
-        p_t = torch.sigmoid(z_t_hat / self.T).detach()
-
-        # student probs
-        p_b = torch.sigmoid(z_b / self.T)
-
-        # teacher-student soft BCE (multilabel)
-        # (T^2 스케일은 KL에서 자주 쓰는 보정인데, soft-BCE에서는 선택 사항)
-        with torch.cuda.amp.autocast(enabled=False):
-            loss_h = F.binary_cross_entropy(p_b.float(), p_h.float(), reduction="none").mean(dim=1)
-            loss_t = F.binary_cross_entropy(p_b.float(), p_t.float(), reduction="none").mean(dim=1)
-
-        # adaptive weights kappa (더 틀리는 쪽에 가중치↑)
-        with torch.no_grad():
-            lh = (loss_h + self.eps).pow(self.alpha)
-            lt = (loss_t + self.eps).pow(self.alpha)
-            denom = lh + lt + self.eps
-            k_h = lh / denom
-            k_t = lt / denom
-
-        return (k_h * loss_h + k_t * loss_t).mean()
- 
-
 class PLMICD4(nn.Module):
     def __init__(self, num_classes: int, model_path: str,
                  cls_num_list = None, 
@@ -311,8 +279,8 @@ class PLMICD4(nn.Module):
         
         self.roberta.gradient_checkpointing_enable()
 
-        self.attn_h = LabelAttentionWithAux(input_size=H, projection_size=H, num_classes=len(head_idx))
-        self.attn_t = LabelAttentionWithAux(input_size=H, projection_size=H, num_classes=len(tail_idx))
+        self.attn_h = LabelAttentionWithAux(input_size=H, projection_size=H, num_classes=num_classes)
+        self.attn_t = LabelAttentionWithAux(input_size=H, projection_size=H, num_classes=num_classes)
         self.attn_b = LabelAttentionWithAux(input_size=H, projection_size=H, num_classes=num_classes)
       
         self.cls_bal = BalancedCausalNormClassifier(num_classes, self.config.hidden_size)
@@ -321,40 +289,27 @@ class PLMICD4(nn.Module):
 
         self.env_attn = AdditiveEnvAttention(dim=H, num_hiddens=H, dropout=0.1, attn_scale=0.1)
         
-        self.loss = MultiGrainedFocalLoss()
-        self.loss.create_weight(cls_num_list)
+        n_train = float(89098) # 110441
+        self.loss = ASLwithClassWeight(cls_num_list, n_train)  # (C,)
         self.htb_loss = HeadTailBalancerLoss()
         self.htb_loss.PFM = self.loss
         self.mu = 0.9
         self.register_buffer("et_b", torch.zeros(H), persistent=True)
         self.register_buffer("et_h", torch.zeros(H), persistent=True)
         self.register_buffer("et_t", torch.zeros(H), persistent=True)
-        self.lambda_htb = 0.2
-
-    def _scatter(self, part_logits: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-        """
-        part_logits: (B, |idx|)
-        return:      (B, C) with values placed at idx, others 0
-        """
-        B = part_logits.size(0)
-        full = part_logits.new_zeros(B, self.num_classes)
-        full.index_copy_(1, idx, part_logits)
-        return full
         
-    def get_loss(self, logits, targets, z_h=None, z_t=None):
-        loss_main = self.loss(logits, targets)
-        if not (z_h is None):
-            loss_htb = self.htb_loss(z_h, z_t, logits, targets)
-        else:
-            loss_htb = 0.0
-        return loss_main + self.lambda_htb * loss_htb
-        
+    def get_loss(self, z_b, z_h, z_t, z_h_hat, z_t_hat, targets):
+        loss_main = self.loss(z_b, targets)
+        loss_h = self.loss(z_h, targets)
+        loss_t = self.loss(z_t, targets)
+        loss_htb = self.htb_loss(z_h_hat, z_t_hat, z_b, targets)
+        return loss_main + (loss_main + loss_h + loss_t) / 3.0 + loss_htb      
 
     def training_step(self, batch) -> dict[str, torch.Tensor]:
         data, targets, attention_mask = batch.data, batch.targets, batch.attention_mask
         out = self.forward(data, attention_mask, return_all=True)
-        z_b, z_h_hat, z_t_hat = out["z_b"], out["z_h_nm"], out["z_t_nm"]
-        loss = self.get_loss(z_b, targets, z_h_hat, z_t_hat)
+        z_b, z_h, z_t, z_h_hat, z_t_hat = out["z_b"], out["z_h"], out["z_t"], out["z_h_nm"], out["z_t_nm"]
+        loss = self.get_loss(z_b, z_h, z_t, z_h_hat, z_t_hat, targets)
         with torch.no_grad():
             self.et_b.mul_(self.mu).add_((1.0 - self.mu) * out["embed_mean_b"].detach().mean(0))
             self.et_h.mul_(self.mu).add_((1.0 - self.mu) * out["embed_mean_h"].detach().mean(0))
@@ -402,11 +357,6 @@ class PLMICD4(nn.Module):
         z_h, z_h_nm = self.cls_head(f_h, self.et_h)
         z_t, z_t_nm = self.cls_tail(f_t, self.et_t)
         z_b, z_b_nm = self.cls_bal(f_b, self.et_b)
-        
-        z_h = self._scatter(z_h, self.head_idx)
-        z_t = self._scatter(z_t, self.tail_idx)
-        z_h_nm = self._scatter(z_h_nm, self.head_idx)
-        z_t_nm = self._scatter(z_t_nm, self.tail_idx)
 
         if not return_all:
             return z_b  # 기본 반환은 balanced logits로 유지

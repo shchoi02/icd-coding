@@ -22,20 +22,11 @@ from typing import Optional
 from transformers import RobertaModel, AutoConfig
 
 from src.models.modules.attention import LabelAttention
-from src.losses.focal import FocalLoss
-from src.losses.hill import Hill
-from src.losses.asl import AsymmetricLoss
-from src.losses.mfm import MultiGrainedFocalLoss
-from src.losses.pfm import PriorFocalModifierLoss
-from src.losses.resample import ResampleLoss
-from src.losses.rlc import ReflectiveLabelCorrectorLoss
+from src.losses.asl import ASLwithClassWeight
 from src.losses.htb import HeadTailBalancerLoss
-from src.losses.mfm import MultiGrainedFocalLoss
 
 
-
-
-class PLMICD2(nn.Module):
+class PLMICD5(nn.Module):
     def __init__(self, num_classes: int, model_path: str,
                  cls_num_list, 
                  head_idx = None, tail_idx = None,
@@ -76,84 +67,33 @@ class PLMICD2(nn.Module):
         self.register_buffer("tail_idx", torch.tensor(tail_idx))
         self.num_classes = num_classes
         
-        # if class_freq is not None:
-        #     class_mask = (torch.as_tensor(class_freq, dtype=torch.float32) > 0).to(torch.float32)  # (C,)
-        # else:
-        #     class_mask = torch.ones(num_classes, dtype=torch.float32)
-        # self.register_buffer("class_mask", class_mask)  # shape: (C,)
+        if not torch.is_tensor(cls_num_list):
+            cls_num_list = torch.tensor(cls_num_list, dtype=torch.float32)
+        cls_num_list = cls_num_list.float()
 
-        # # [ADDED] 마스킹 시 사용할 고정 음수 로짓(grad/손실 억제)
-        # self.neg_logit_const = -30.0
-        
-        # self.loss = torch.nn.BCEWithLogitsLoss()
-        
-        # self.loss = FocalLoss()
-        
-        # self.loss = Hill()
-        
-        # self.loss = AsymmetricLoss()
-        
-        # self.loss = MultiGrainedFocalLoss()
-        # self.loss.create_weight(cls_num_list)
-        
-        # self.loss = PriorFocalModifierLoss()
-        # self.loss.create_co_occurrence_matrix(co_occurrence_matrix)
-        # self.loss.create_weight(cls_num_list)
-        
-        # self.loss = ResampleLoss(
-        #     use_sigmoid    = True,
-        #     class_freq     = class_freq,
-        #     neg_class_freq = neg_class_freq,
-        #     reweight_func  ='rebalance',
-        # )
-        
-        self.rlc = ReflectiveLabelCorrectorLoss(num_classes=num_classes, distribution=cls_num_list)
-        
-        # self.pfm = PriorFocalModifierLoss()
-        # self.pfm.create_co_occurrence_matrix(co_occurrence_matrix)
-        # self.pfm.create_weight(cls_num_list)
-        
-        self.mfm = MultiGrainedFocalLoss()
-        self.mfm.create_weight(cls_num_list) 
-        self.htb = HeadTailBalancerLoss(PFM=self.mfm)
-    
-    # def _apply_train_mask(self,
-    #                   head: torch.Tensor,
-    #                   tail: torch.Tensor,
-    #                   bal:  torch.Tensor,
-    #                   labels: torch.Tensor):
-    #     """
-    #     head/tail/bal: (B, C), labels: (B, C)
-    #     class_mask m:  (C,), train에서만 적용
-    #     """
-    #     if self.class_mask is None:
-    #         return head, tail, bal, labels
-
-    #     m = self.class_mask.unsqueeze(0)  # (1, C)
-    #     head_m = head * m + self.neg_logit_const * (1.0 - m)
-    #     tail_m = tail * m + self.neg_logit_const * (1.0 - m)
-    #     bal_m  = bal  * m + self.neg_logit_const * (1.0 - m)
-    #     labels_m = labels * m
-    #     return head_m, tail_m, bal_m, labels_m
+        head_counts = cls_num_list.index_select(0, self.head_idx)
+        tail_counts = cls_num_list.index_select(0, self.tail_idx)
+        n_train = float(89098) # 110441
+        self.wasl_b = ASLwithClassWeight(cls_num_list, n_train)  # (C,)
+        self.wasl_h = ASLwithClassWeight(head_counts, n_train)   # (|H|)
+        self.wasl_t = ASLwithClassWeight(tail_counts, n_train)   # (|T|)
+        self.htb = HeadTailBalancerLoss(PFM=self.wasl_b)
  
-    def _composite_loss(self, head, tail, bal, labels):
-        loss_r = self.rlc(bal, labels)
-        loss_m = self.mfm(bal, labels)          
+    def _composite_loss(self, head, tail, bal, z_h_part, z_t_part, labels):
+        y_h = labels.index_select(1, self.head_idx)  # (B, |H|)
+        y_t = labels.index_select(1, self.tail_idx)  # (B, |T|)
+        loss_m = self.wasl_b(bal, labels) 
+        loss_wasl = (loss_m + self.wasl_h(z_h_part, y_h) + self.wasl_t(z_t_part, y_t)) / 3.0
         loss_b = self.htb(head, tail, bal, labels) 
-        # return loss_r
-        # return loss_b
-        # return self.lambda_r * loss_r + self.lambda_m * loss_m   
-        # return self.lambda_m * loss_m + self.lambda_b * loss_b
-        # return self.lambda_r * loss_r + self.lambda_b * loss_b
-        return self.lambda_r * loss_r + self.lambda_m * loss_m + self.lambda_b * loss_b
+        return loss_m + loss_wasl + loss_b
 
     def get_loss(self, head, tail, bal, targets):
         return self._composite_loss(head, tail, bal, targets)
 
     def training_step(self, batch) -> dict[str, torch.Tensor]:
         data, targets, attention_mask = batch.data, batch.targets, batch.attention_mask
-        z_head, z_tail, z_bal = self(data, attention_mask)
-        loss = self.get_loss(z_head, z_tail, z_bal, targets)
+        z_head, z_tail, z_bal, z_h_part, z_t_part = self(data, attention_mask)
+        loss = self.get_loss(z_head, z_tail, z_bal, z_h_part, z_t_part, targets)
         logits = torch.sigmoid(z_bal)
         return {"logits": logits, "loss": loss, "targets": targets}
 
@@ -190,11 +130,11 @@ class PLMICD2(nn.Module):
         )
         hidden_output = outputs[0].view(batch_size, num_chunks * chunk_size, -1)
         
-        logits_head = self.att_head(hidden_output)
+        logits_head_part = self.att_head(hidden_output)
         logits_bal  = self.att_bal(hidden_output) 
-        logits_tail = self.att_tail(hidden_output)
+        logits_tail_part = self.att_tail(hidden_output)
         
-        logits_head = self._scatter(logits_head, self.head_idx)
-        logits_tail = self._scatter(logits_tail, self.tail_idx) 
+        logits_head = self._scatter(logits_head_part, self.head_idx)
+        logits_tail = self._scatter(logits_tail_part, self.tail_idx) 
         
-        return logits_head, logits_tail, logits_bal
+        return logits_head, logits_tail, logits_bal, logits_head_part, logits_tail_part
