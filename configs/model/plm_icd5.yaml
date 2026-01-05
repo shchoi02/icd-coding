@@ -1,0 +1,4 @@
+name: PLMICD5
+configs:
+  model_path: /home/mixlab/tabular/icd-coding/RoBERTa-base-PM-M3-Voc/RoBERTa-base-PM-M3-Voc-hf
+

@@ -241,6 +241,15 @@ class HeadTailBalancerLoss(nn.Module):
         return loss
  
 
+def masked_mean_pool(hidden: torch.Tensor, mask1d: Optional[torch.Tensor]):
+    # hidden: (B, L, H), mask1d: (B, L) with 1 valid / 0 pad
+    if mask1d is None:
+        return hidden.mean(dim=1)
+    mask = mask1d.unsqueeze(-1).to(hidden.dtype)          # (B,L,1)
+    denom = mask.sum(dim=1).clamp(min=1.0)                # (B,1)
+    return (hidden * mask).sum(dim=1) / denom             # (B,H)
+
+
 class PLMICD3(nn.Module):
     def __init__(self, num_classes: int, model_path: str,
                  cls_num_list = None, 
@@ -274,9 +283,9 @@ class PLMICD3(nn.Module):
         n_train = float(89098)
         self.loss = ASLwithClassWeight(cls_num_list, n_train)
       
-        self.cls_bal = BalancedCausalNormClassifier(num_classes, self.config.hidden_size)
-        self.cls_head = HeadCausalNormClassifier(len(head_idx), self.config.hidden_size)
-        self.cls_tail = TailCausalNormClassifier(len(tail_idx), self.config.hidden_size)
+        self.cls_bal  = BalancedCausalNormClassifier(num_classes, H)
+        self.cls_head = HeadCausalNormClassifier(num_classes, H)
+        self.cls_tail = TailCausalNormClassifier(num_classes, H) 
 
         self.env_attn = AdditiveEnvAttention(dim=H, num_hiddens=H, dropout=0.1, attn_scale=0.1)
         
@@ -336,12 +345,12 @@ class PLMICD3(nn.Module):
             return_dict=False,
         )
         hidden = out[0].view(batch_size, num_chunks * chunk_size, -1)  # [B, L, H]
+        f0 = masked_mean_pool(hidden, mask1d)
         
-        laat_h, aux_h = self.attn_h(hidden, attention_mask_1d=mask1d, return_aux=True)
-        laat_t, aux_t = self.attn_t(hidden, attention_mask_1d=mask1d, return_aux=True)
-        laat_b, aux_b = self.attn_b(hidden, attention_mask_1d=mask1d, return_aux=True)
+        f_h = self.adapt_h(f0)
+        f_t = self.adapt_t(f0)
+        f_hat_b = self.adapt_b(f0)
  
-        f_h, f_t, f_hat_b = aux_h["embed_mean"], aux_t["embed_mean"], aux_b["embed_mean"]
         f_b = self.env_attn(f_hat_b, f_h, f_t)
 
         z_h, z_h_nm = self.cls_head(f_h, self.et_h)
@@ -355,6 +364,5 @@ class PLMICD3(nn.Module):
             "z_b": z_b, "z_h": z_h, "z_t": z_t,
             "z_b_nm": z_b_nm, "z_h_nm": z_h_nm, "z_t_nm": z_t_nm,
             "embed_mean_b": f_hat_b, "embed_mean_h": f_h, "embed_mean_t": f_t,
-            "laat_logits_b": laat_b, "laat_logits_h": laat_h, "laat_logits_t": laat_t,
         }
     

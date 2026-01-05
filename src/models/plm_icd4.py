@@ -284,8 +284,8 @@ class PLMICD4(nn.Module):
         self.attn_b = LabelAttentionWithAux(input_size=H, projection_size=H, num_classes=num_classes)
       
         self.cls_bal = BalancedCausalNormClassifier(num_classes, self.config.hidden_size)
-        self.cls_head = HeadCausalNormClassifier(len(head_idx), self.config.hidden_size)
-        self.cls_tail = TailCausalNormClassifier(len(tail_idx), self.config.hidden_size)
+        self.cls_head = HeadCausalNormClassifier(num_classes, self.config.hidden_size)
+        self.cls_tail = TailCausalNormClassifier(num_classes, self.config.hidden_size)
 
         self.env_attn = AdditiveEnvAttention(dim=H, num_hiddens=H, dropout=0.1, attn_scale=0.1)
         

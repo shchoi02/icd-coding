@@ -79,7 +79,7 @@ class PLMICD5(nn.Module):
         self.wasl_t = ASLwithClassWeight(tail_counts, n_train)   # (|T|)
         self.htb = HeadTailBalancerLoss(PFM=self.wasl_b)
  
-    def _composite_loss(self, head, tail, bal, z_h_part, z_t_part, labels):
+    def get_loss(self, head, tail, bal, z_h_part, z_t_part, labels):
         y_h = labels.index_select(1, self.head_idx)  # (B, |H|)
         y_t = labels.index_select(1, self.tail_idx)  # (B, |T|)
         loss_m = self.wasl_b(bal, labels) 
@@ -87,12 +87,9 @@ class PLMICD5(nn.Module):
         loss_b = self.htb(head, tail, bal, labels) 
         return loss_m + loss_wasl + loss_b
 
-    def get_loss(self, head, tail, bal, targets):
-        return self._composite_loss(head, tail, bal, targets)
-
     def training_step(self, batch) -> dict[str, torch.Tensor]:
         data, targets, attention_mask = batch.data, batch.targets, batch.attention_mask
-        z_head, z_tail, z_bal, z_h_part, z_t_part = self(data, attention_mask)
+        z_head, z_tail, z_bal, z_h_part, z_t_part = self(data, attention_mask, return_all=True)
         loss = self.get_loss(z_head, z_tail, z_bal, z_h_part, z_t_part, targets)
         logits = torch.sigmoid(z_bal)
         return {"logits": logits, "loss": loss, "targets": targets}
@@ -114,6 +111,7 @@ class PLMICD5(nn.Module):
         self,
         input_ids=None,
         attention_mask=None,
+        return_all=False,
     ):
         r"""
         input_ids (torch.LongTensor of shape (batch_size, num_chunks, chunk_size))
@@ -136,5 +134,9 @@ class PLMICD5(nn.Module):
         
         logits_head = self._scatter(logits_head_part, self.head_idx)
         logits_tail = self._scatter(logits_tail_part, self.tail_idx) 
+        
+        
+        if not return_all:
+            return logits_bal # 기본 반환은 balanced logits로 유지
         
         return logits_head, logits_tail, logits_bal, logits_head_part, logits_tail_part
