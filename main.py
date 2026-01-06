@@ -99,7 +99,7 @@ def compute_class_stats(
 
 
 def get_head_tail_indices(label_transform):
-    with open('/home/mixlab/tabular/icd-coding/files/data/mimiciv_full_icd10/icd10_longtail_split.json', "r", encoding="utf-8") as jf:
+    with open('/home/mixlab/tabular/icd-coding/files/data/mimiciv_icd10/icd10_longtail_split.json', "r", encoding="utf-8") as jf:
         ht_dict = json.load(jf)
 
     head_codes = list(ht_dict["head"].keys())

@@ -26,7 +26,9 @@ from src.losses.asl import ASLwithClassWeight
 from src.losses.htb import HeadTailBalancerLoss
 
 
-class PLMICD5(nn.Module):
+
+
+class PLMICD2(nn.Module):
     def __init__(self, num_classes: int, model_path: str,
                  cls_num_list, 
                  head_idx = None, tail_idx = None,
@@ -42,7 +44,6 @@ class PLMICD5(nn.Module):
         self.roberta = RobertaModel(
             self.config, add_pooling_layer=False
         ).from_pretrained(model_path, config=self.config)
-        
         self.roberta.gradient_checkpointing_enable()
         
         self.att_head = LabelAttention(
@@ -65,36 +66,32 @@ class PLMICD5(nn.Module):
         self.register_buffer("tail_idx", torch.tensor(tail_idx))
         self.num_classes = num_classes
         
-        if not torch.is_tensor(cls_num_list):
-            cls_num_list = torch.tensor(cls_num_list, dtype=torch.float32)
-        cls_num_list = cls_num_list.float()
-
-        head_counts = cls_num_list.index_select(0, self.head_idx)
-        tail_counts = cls_num_list.index_select(0, self.tail_idx)
         n_train = float(89098) # 110441
         self.loss = ASLwithClassWeight(cls_num_list, n_train)
-        self.htb = HeadTailBalancerLoss(PFM=self.wasl_b)
+        self.htb = HeadTailBalancerLoss(PFM=self.loss)
  
-    def get_loss(self, head, tail, bal, z_h_part, z_t_part, labels):
-        y_h = labels.index_select(1, self.head_idx)  # (B, |H|)
-        y_t = labels.index_select(1, self.tail_idx)  # (B, |T|)
-        loss_m = self.wasl_b(bal, labels) 
-        loss_wasl = (loss_m + self.wasl_h(z_h_part, y_h) + self.wasl_t(z_t_part, y_t)) / 3.0
+    def _composite_loss(self, head, tail, bal, labels):
+        loss_m = self.loss(bal, labels)
+        loss_h = self.loss(head, labels)
+        loss_t = self.loss(tail, labels)          
         loss_b = self.htb(head, tail, bal, labels) 
-        return loss_m + loss_wasl + loss_b
+        return loss_m + (loss_h + loss_b + loss_t) / 3.0 + loss_b
+
+    def get_loss(self, head, tail, bal, targets):
+        return self._composite_loss(head, tail, bal, targets)
 
     def training_step(self, batch) -> dict[str, torch.Tensor]:
         data, targets, attention_mask = batch.data, batch.targets, batch.attention_mask
-        z_head, z_tail, z_bal, z_h_part, z_t_part = self(data, attention_mask, return_all=True)
-        loss = self.get_loss(z_head, z_tail, z_bal, z_h_part, z_t_part, targets)
+        z_head, z_tail, z_bal = self(data, attention_mask)
+        loss = self.get_loss(z_head, z_tail, z_bal, targets)
         logits = torch.sigmoid(z_bal)
         return {"logits": logits, "loss": loss, "targets": targets}
 
     def validation_step(self, batch) -> dict[str, torch.Tensor]:
         data, targets, attention_mask = batch.data, batch.targets, batch.attention_mask
-        z_b = self(data, attention_mask)
-        loss = self.wasl_b(z_b, targets)
-        logits = torch.sigmoid(z_b)
+        z_head, z_tail, z_bal = self(data, attention_mask)
+        loss = self.get_loss(z_head, z_tail, z_bal, targets)
+        logits = torch.sigmoid(z_bal)
         return {"logits": logits, "loss": loss, "targets": targets}
      
     def _scatter(self, part_logits: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
@@ -107,7 +104,6 @@ class PLMICD5(nn.Module):
         self,
         input_ids=None,
         attention_mask=None,
-        return_all=False,
     ):
         r"""
         input_ids (torch.LongTensor of shape (batch_size, num_chunks, chunk_size))
@@ -124,15 +120,11 @@ class PLMICD5(nn.Module):
         )
         hidden_output = outputs[0].view(batch_size, num_chunks * chunk_size, -1)
         
-        logits_head_part = self.att_head(hidden_output)
+        logits_head = self.att_head(hidden_output)
         logits_bal  = self.att_bal(hidden_output) 
-        logits_tail_part = self.att_tail(hidden_output)
+        logits_tail = self.att_tail(hidden_output)
         
-        logits_head = self._scatter(logits_head_part, self.head_idx)
-        logits_tail = self._scatter(logits_tail_part, self.tail_idx) 
+        logits_head = self._scatter(logits_head, self.head_idx)
+        logits_tail = self._scatter(logits_tail, self.tail_idx) 
         
-        
-        if not return_all:
-            return logits_bal # 기본 반환은 balanced logits로 유지
-        
-        return logits_head, logits_tail, logits_bal, logits_head_part, logits_tail_part
+        return logits_head, logits_tail, logits_bal

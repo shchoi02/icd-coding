@@ -42,7 +42,7 @@ def get_code_system2code_indices(
         code_system2code_indices[codesystem] = label_transform.get_indices(
             set(codes.keys())
         )
-    with open("/home/mixlab/tabular/icd-coding/files/data/mimiciv_full_icd10/icd10_longtail_split.json", "r") as f:
+    with open("/home/mixlab/tabular/icd-coding/files/data/mimiciv_icd10/icd10_longtail_split.json", "r") as f:
         custom_classes = json.load(f)
 
     keys = ["head", "medium", "tail"]

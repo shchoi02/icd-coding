@@ -321,7 +321,7 @@ class PLMICD4(nn.Module):
     def validation_step(self, batch) -> dict[str, torch.Tensor]:
         data, targets, attention_mask = batch.data, batch.targets, batch.attention_mask
         logits = self(data, attention_mask)
-        loss = self.get_loss(logits, targets)
+        loss = self.loss(logits, targets)
         logits = torch.sigmoid(logits)
         return {"logits": logits, "loss": loss, "targets": targets}
 
