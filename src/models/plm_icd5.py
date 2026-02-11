@@ -22,8 +22,17 @@ from typing import Optional
 from transformers import RobertaModel, AutoConfig
 
 from src.models.modules.attention import LabelAttention
-from src.losses.asl import ASLwithClassWeight
+from src.losses.focal import FocalLoss
+from src.losses.hill import Hill
+from src.losses.asl import AsymmetricLoss
+from src.losses.mfm import MultiGrainedFocalLoss
+from src.losses.pfm import PriorFocalModifierLoss
+from src.losses.resample import ResampleLoss
+from src.losses.rlc import ReflectiveLabelCorrectorLoss
 from src.losses.htb import HeadTailBalancerLoss
+from src.losses.mfm import MultiGrainedFocalLoss
+
+
 
 
 class PLMICD5(nn.Module):
@@ -35,19 +44,23 @@ class PLMICD5(nn.Module):
                  **kwargs):
         super().__init__()
         
+        self.lambda_r = 0.2
+        self.lambda_m = 1.0
+        self.lambda_b = 1.0
+        
         self.config = AutoConfig.from_pretrained(
             model_path, num_labels=num_classes, finetuning_task=None
         )
         
-        self.roberta = RobertaModel(
-            self.config, add_pooling_layer=False
-        ).from_pretrained(model_path, config=self.config)
-        
-        self.roberta.gradient_checkpointing_enable()
+        self.roberta_h = RobertaModel(self.config, add_pooling_layer=False).from_pretrained(model_path, config=self.config)
+        self.roberta_b = RobertaModel(self.config, add_pooling_layer=False).from_pretrained(model_path, config=self.config)
+        self.roberta_t = RobertaModel(self.config, add_pooling_layer=False).from_pretrained(model_path, config=self.config)
+
         
         self.att_head = LabelAttention(
             input_size=self.config.hidden_size,
             projection_size=self.config.hidden_size,
+            # num_classes=num_classes
             num_classes=len(head_idx),
         )
         self.att_bal = LabelAttention(
@@ -59,42 +72,39 @@ class PLMICD5(nn.Module):
             input_size=self.config.hidden_size,
             projection_size=self.config.hidden_size,
             num_classes=len(tail_idx),
+            # num_classes=num_classes
         )
         
         self.register_buffer("head_idx", torch.tensor(head_idx))
         self.register_buffer("tail_idx", torch.tensor(tail_idx))
         self.num_classes = num_classes
-        
-        if not torch.is_tensor(cls_num_list):
-            cls_num_list = torch.tensor(cls_num_list, dtype=torch.float32)
-        cls_num_list = cls_num_list.float()
 
-        head_counts = cls_num_list.index_select(0, self.head_idx)
-        tail_counts = cls_num_list.index_select(0, self.tail_idx)
-        n_train = float(89098) # 110441
-        self.loss = ASLwithClassWeight(cls_num_list, n_train)
-        self.htb = HeadTailBalancerLoss(PFM=self.wasl_b)
+        
+        self.mfm = MultiGrainedFocalLoss()
+        self.mfm.create_weight(cls_num_list) 
+        self.htb = HeadTailBalancerLoss(PFM=self.mfm)
+    
  
-    def get_loss(self, head, tail, bal, z_h_part, z_t_part, labels):
-        y_h = labels.index_select(1, self.head_idx)  # (B, |H|)
-        y_t = labels.index_select(1, self.tail_idx)  # (B, |T|)
-        loss_m = self.wasl_b(bal, labels) 
-        loss_wasl = (loss_m + self.wasl_h(z_h_part, y_h) + self.wasl_t(z_t_part, y_t)) / 3.0
+    def _composite_loss(self, head, tail, bal, labels):
+        loss_m = self.mfm(bal, labels)          
         loss_b = self.htb(head, tail, bal, labels) 
-        return loss_m + loss_wasl + loss_b
+        return self.lambda_m * loss_m + self.lambda_b * loss_b
+
+    def get_loss(self, head, tail, bal, targets):
+        return self._composite_loss(head, tail, bal, targets)
 
     def training_step(self, batch) -> dict[str, torch.Tensor]:
         data, targets, attention_mask = batch.data, batch.targets, batch.attention_mask
-        z_head, z_tail, z_bal, z_h_part, z_t_part = self(data, attention_mask, return_all=True)
-        loss = self.get_loss(z_head, z_tail, z_bal, z_h_part, z_t_part, targets)
+        z_head, z_tail, z_bal = self(data, attention_mask)
+        loss = self.get_loss(z_head, z_tail, z_bal, targets)
         logits = torch.sigmoid(z_bal)
         return {"logits": logits, "loss": loss, "targets": targets}
 
     def validation_step(self, batch) -> dict[str, torch.Tensor]:
         data, targets, attention_mask = batch.data, batch.targets, batch.attention_mask
-        z_b = self(data, attention_mask)
-        loss = self.wasl_b(z_b, targets)
-        logits = torch.sigmoid(z_b)
+        z_head, z_tail, z_bal = self(data, attention_mask)
+        loss = self.get_loss(z_head, z_tail, z_bal, targets)
+        logits = torch.sigmoid(z_bal)
         return {"logits": logits, "loss": loss, "targets": targets}
      
     def _scatter(self, part_logits: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
@@ -107,7 +117,6 @@ class PLMICD5(nn.Module):
         self,
         input_ids=None,
         attention_mask=None,
-        return_all=False,
     ):
         r"""
         input_ids (torch.LongTensor of shape (batch_size, num_chunks, chunk_size))
@@ -115,24 +124,22 @@ class PLMICD5(nn.Module):
         """
 
         batch_size, num_chunks, chunk_size = input_ids.size()
-        outputs = self.roberta(
-            input_ids.view(-1, chunk_size),
-            attention_mask=attention_mask.view(-1, chunk_size)
-            if attention_mask is not None
-            else None,
-            return_dict=False,
-        )
-        hidden_output = outputs[0].view(batch_size, num_chunks * chunk_size, -1)
-        
-        logits_head_part = self.att_head(hidden_output)
-        logits_bal  = self.att_bal(hidden_output) 
-        logits_tail_part = self.att_tail(hidden_output)
-        
-        logits_head = self._scatter(logits_head_part, self.head_idx)
-        logits_tail = self._scatter(logits_tail_part, self.tail_idx) 
-        
-        
-        if not return_all:
-            return logits_bal # 기본 반환은 balanced logits로 유지
-        
-        return logits_head, logits_tail, logits_bal, logits_head_part, logits_tail_part
+        flat_ids = input_ids.view(-1, chunk_size)
+        flat_mask = attention_mask.view(-1, chunk_size) if attention_mask is not None else None
+
+        out_h = self.roberta_h(flat_ids, attention_mask=flat_mask, return_dict=False)
+        out_b = self.roberta_b(flat_ids, attention_mask=flat_mask, return_dict=False)
+        out_t = self.roberta_t(flat_ids, attention_mask=flat_mask, return_dict=False)
+
+        hidden_h = out_h[0].view(batch_size, num_chunks * chunk_size, -1)
+        hidden_b = out_b[0].view(batch_size, num_chunks * chunk_size, -1)
+        hidden_t = out_t[0].view(batch_size, num_chunks * chunk_size, -1)
+
+        logits_head = self.att_head(hidden_h)
+        logits_bal  = self.att_bal(hidden_b)
+        logits_tail = self.att_tail(hidden_t)
+
+        logits_head = self._scatter(logits_head, self.head_idx)
+        logits_tail = self._scatter(logits_tail, self.tail_idx)
+
+        return logits_head, logits_tail, logits_bal

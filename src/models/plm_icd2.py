@@ -22,8 +22,15 @@ from typing import Optional
 from transformers import RobertaModel, AutoConfig
 
 from src.models.modules.attention import LabelAttention
-from src.losses.asl import ASLwithClassWeight
+from src.losses.focal import FocalLoss
+from src.losses.hill import Hill
+from src.losses.asl import AsymmetricLoss
+from src.losses.mfm import MultiGrainedFocalLoss
+from src.losses.pfm import PriorFocalModifierLoss
+from src.losses.resample import ResampleLoss
+from src.losses.rlc import ReflectiveLabelCorrectorLoss
 from src.losses.htb import HeadTailBalancerLoss
+from src.losses.mfm import MultiGrainedFocalLoss
 
 
 
@@ -37,6 +44,10 @@ class PLMICD2(nn.Module):
                  **kwargs):
         super().__init__()
         
+        self.lambda_r = 0.2
+        self.lambda_m = 1.0
+        self.lambda_b = 1.0
+        
         self.config = AutoConfig.from_pretrained(
             model_path, num_labels=num_classes, finetuning_task=None
         )
@@ -44,11 +55,11 @@ class PLMICD2(nn.Module):
         self.roberta = RobertaModel(
             self.config, add_pooling_layer=False
         ).from_pretrained(model_path, config=self.config)
-        self.roberta.gradient_checkpointing_enable()
         
         self.att_head = LabelAttention(
             input_size=self.config.hidden_size,
             projection_size=self.config.hidden_size,
+            # num_classes=num_classes
             num_classes=len(head_idx),
         )
         self.att_bal = LabelAttention(
@@ -60,22 +71,83 @@ class PLMICD2(nn.Module):
             input_size=self.config.hidden_size,
             projection_size=self.config.hidden_size,
             num_classes=len(tail_idx),
+            # num_classes=num_classes
         )
         
         self.register_buffer("head_idx", torch.tensor(head_idx))
         self.register_buffer("tail_idx", torch.tensor(tail_idx))
         self.num_classes = num_classes
         
-        n_train = float(89098) # 110441
-        self.loss = ASLwithClassWeight(cls_num_list, n_train)
-        self.htb = HeadTailBalancerLoss(PFM=self.loss)
+        # if class_freq is not None:
+        #     class_mask = (torch.as_tensor(class_freq, dtype=torch.float32) > 0).to(torch.float32)  # (C,)
+        # else:
+        #     class_mask = torch.ones(num_classes, dtype=torch.float32)
+        # self.register_buffer("class_mask", class_mask)  # shape: (C,)
+
+        # # [ADDED] 마스킹 시 사용할 고정 음수 로짓(grad/손실 억제)
+        # self.neg_logit_const = -30.0
+        
+        # self.loss = torch.nn.BCEWithLogitsLoss()
+        
+        # self.loss = FocalLoss()
+        
+        # self.loss = Hill()
+        
+        # self.loss = AsymmetricLoss()
+        
+        # self.loss = MultiGrainedFocalLoss()
+        # self.loss.create_weight(cls_num_list)
+        
+        # self.loss = PriorFocalModifierLoss()
+        # self.loss.create_co_occurrence_matrix(co_occurrence_matrix)
+        # self.loss.create_weight(cls_num_list)
+        
+        # self.loss = ResampleLoss(
+        #     use_sigmoid    = True,
+        #     class_freq     = class_freq,
+        #     neg_class_freq = neg_class_freq,
+        #     reweight_func  ='rebalance',
+        # )
+        
+        # self.rlc = ReflectiveLabelCorrectorLoss(num_classes=num_classes, distribution=cls_num_list)
+        
+        # self.pfm = PriorFocalModifierLoss()
+        # self.pfm.create_co_occurrence_matrix(co_occurrence_matrix)
+        # self.pfm.create_weight(cls_num_list)
+        
+        self.mfm = MultiGrainedFocalLoss()
+        self.mfm.create_weight(cls_num_list) 
+        self.htb = HeadTailBalancerLoss(PFM=self.mfm)
+    
+    # def _apply_train_mask(self,
+    #                   head: torch.Tensor,
+    #                   tail: torch.Tensor,
+    #                   bal:  torch.Tensor,
+    #                   labels: torch.Tensor):
+    #     """
+    #     head/tail/bal: (B, C), labels: (B, C)
+    #     class_mask m:  (C,), train에서만 적용
+    #     """
+    #     if self.class_mask is None:
+    #         return head, tail, bal, labels
+
+    #     m = self.class_mask.unsqueeze(0)  # (1, C)
+    #     head_m = head * m + self.neg_logit_const * (1.0 - m)
+    #     tail_m = tail * m + self.neg_logit_const * (1.0 - m)
+    #     bal_m  = bal  * m + self.neg_logit_const * (1.0 - m)
+    #     labels_m = labels * m
+    #     return head_m, tail_m, bal_m, labels_m
  
     def _composite_loss(self, head, tail, bal, labels):
-        loss_m = self.loss(bal, labels)
-        loss_h = self.loss(head, labels)
-        loss_t = self.loss(tail, labels)          
+        # loss_r = self.rlc(bal, labels)
+        loss_m = self.mfm(bal, labels)          
         loss_b = self.htb(head, tail, bal, labels) 
-        return loss_m + (loss_h + loss_b + loss_t) / 3.0 + loss_b
+        # return loss_r
+        # return loss_b
+        # return self.lambda_r * loss_r + self.lambda_m * loss_m   
+        # return self.lambda_m * loss_m + self.lambda_b * loss_b
+        # return self.lambda_r * loss_r + self.lambda_b * loss_b
+        return self.lambda_m * loss_m + self.lambda_b * loss_b
 
     def get_loss(self, head, tail, bal, targets):
         return self._composite_loss(head, tail, bal, targets)

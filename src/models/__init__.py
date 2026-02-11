@@ -12,4 +12,5 @@ from src.models.plm_icd2 import PLMICD2
 from src.models.plm_icd3 import PLMICD3
 from src.models.plm_icd4 import PLMICD4
 from src.models.plm_icd5 import PLMICD5
+from src.models.plm_icd6 import PLMICD6
 

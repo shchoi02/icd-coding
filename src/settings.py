@@ -22,7 +22,7 @@ DATA_DIRECTORY_MIMICIV_ICD9 = OmegaConf.load("configs/data/mimiciv_icd9.yaml").d
 DATA_DIRECTORY_MIMICIV_ICD10 = OmegaConf.load("configs/data/mimiciv_icd10.yaml").dir
 
 PROJECT = "ICD10" # this variable is used for genersating plots and tables from wandb
-EXPERIMENT_DIR = "/home/mixlab/tabular/icd-coding/experiments"  # Path to the experiment directory. Example: ~/experiments
+EXPERIMENT_DIR = "/mnt/zvrs202/mixlab/mixlab/tabular/icd-coding/experiments"  # Path to the experiment directory. Example: ~/experiments
 PALETTE = {
     "PLM-ICD": "#E69F00",
     "LAAT": "#009E73",

@@ -159,11 +159,10 @@ class PLMICD(nn.Module):
         # )
         
         # self.loss = torch.nn.functional.binary_cross_entropy_with_logits
-        self.loss = CrossEntropyLoss(use_sigmoid=True)
         
         # self.loss = Hill()
         
-        # self.loss = FocalLoss()
+        self.loss = FocalLoss()
         
         # self.loss = ResampleLoss( # CB Loss
         #     use_sigmoid=True,                 

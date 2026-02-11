@@ -31,7 +31,7 @@ def best_f1_per_class_sklearn(logits: torch.Tensor,
 
     return best_f1, best_thr
 
-def f1_score_db_tuning(logits, targets, groups, average="micro", type="single"):
+def f1_score_db_tuning(logits, targets, groups, average="per_class2", type="single"):
     device, dtype = logits.device, logits.dtype
     if average not in ["micro", "macro"]: 
         raise ValueError("Average must be either 'micro' or 'macro'")
@@ -67,6 +67,57 @@ def f1_score_db_tuning(logits, targets, groups, average="micro", type="single"):
         best_f1 = torch.tensor(best_f1, device=device, dtype=dtype)
         best_db  = torch.tensor(best_db,  device=device, dtype=dtype)
         return best_f1, best_db
+    
+    if type == "per_class2":
+        MIN_POS = 10
+        MIN_PRED_POS = 1
+
+        best_idx = int(f1_scores.argmax().item())
+        thr_global = float(dbs[best_idx].item())
+
+        y_true = targets.detach().cpu().numpy().astype(np.int32)
+        y_prob = logits.detach().cpu().numpy().astype(np.float64)
+
+        best_f1_list, best_db_list = [], []
+        backed_off_lowpos = 0
+        backed_off_degen = 0
+
+        for c in range(n_cls):
+            pos_cnt = int(y_true[:, c].sum())
+
+            # (1) positives 부족 -> global
+            if pos_cnt < MIN_POS:
+                best_f1_list.append(0.0)
+                best_db_list.append(thr_global)
+                backed_off_lowpos += 1
+                continue
+
+            p, r, th = precision_recall_curve(y_true[:, c], y_prob[:, c])
+            f1 = 2 * p * r / (p + r + 1e-12)
+            j = int(f1.argmax())
+            thr_c = float(th[j]) if j < len(th) else 1.0
+
+            # (2) degenerate(all-zero) -> global
+            pred_pos = int((y_prob[:, c] > thr_c).sum())
+            if pred_pos < MIN_PRED_POS:
+                best_f1_list.append(0.0)
+                best_db_list.append(thr_global)
+                backed_off_degen += 1
+                continue
+
+            # ✅ alpha 없음: 순수 per-class thr 사용
+            best_f1_list.append(float(f1[j]))
+            best_db_list.append(float(thr_c))
+
+        best_f1_t = torch.tensor(best_f1_list, device=device, dtype=dtype)
+        best_db_t = torch.tensor(best_db_list, device=device, dtype=dtype)
+
+        print(f"[per_class sanity A] thr_global={thr_global:.4f} | "
+            f"backed_off_lowpos={backed_off_lowpos}/{n_cls} | "
+            f"backed_off_degen={backed_off_degen}/{n_cls}")
+
+        return best_f1_t, best_db_t
+
     
     if type == "per_group":
         thr_vec = torch.full((targets.shape[1],), 0.5)

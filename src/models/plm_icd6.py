@@ -250,7 +250,7 @@ def masked_mean_pool(hidden: torch.Tensor, mask1d: Optional[torch.Tensor]):
     return (hidden * mask).sum(dim=1) / denom             # (B,H)
 
 
-class PLMICD3(nn.Module):
+class PLMICD6(nn.Module):
     def __init__(self, num_classes: int, model_path: str,
                  cls_num_list = None, 
                  head_idx = None, tail_idx = None,
@@ -266,10 +266,9 @@ class PLMICD3(nn.Module):
         self.num_classes = num_classes
         
         H = self.config.hidden_size
-        self.roberta = RobertaModel(self.config, add_pooling_layer=False).from_pretrained(model_path, config=self.config)
-        self.roberta.gradient_checkpointing_enable()
-
-        H = self.config.hidden_size
+        self.roberta_h = RobertaModel(self.config, add_pooling_layer=False).from_pretrained(model_path, config=self.config)
+        self.roberta_b = RobertaModel(self.config, add_pooling_layer=False).from_pretrained(model_path, config=self.config)
+        self.roberta_t = RobertaModel(self.config, add_pooling_layer=False).from_pretrained(model_path, config=self.config)
 
         # ---- adapters (CXR처럼 3분기)
         self.adapt_h = BranchAdapter(H, r=256, dropout=0.0)
@@ -333,26 +332,35 @@ class PLMICD3(nn.Module):
         """
                 
         batch_size, num_chunks, chunk_size = input_ids.size()
-        mask2d = attention_mask.view(-1, chunk_size) if attention_mask is not None else None
-        mask1d = attention_mask.view(batch_size, -1)  if attention_mask is not None else None
-        
-        out = self.roberta(
-            input_ids.view(-1, chunk_size),
-            attention_mask=mask2d,
-            return_dict=False,
-        )
-        hidden = out[0].view(batch_size, num_chunks * chunk_size, -1)  # [B, L, H]
-        f0 = masked_mean_pool(hidden, mask1d)
-        
-        f_h = self.adapt_h(f0)
-        f_t = self.adapt_t(f0)
-        f_hat_b = self.adapt_b(f0)
- 
+        flat_ids  = input_ids.view(-1, chunk_size)
+        mask2d    = attention_mask.view(-1, chunk_size) if attention_mask is not None else None
+        mask1d    = attention_mask.view(batch_size, -1) if attention_mask is not None else None
+
+        out_h = self.roberta_h(flat_ids, attention_mask=mask2d, return_dict=False)
+        out_b = self.roberta_b(flat_ids, attention_mask=mask2d, return_dict=False)
+        out_t = self.roberta_t(flat_ids, attention_mask=mask2d, return_dict=False)
+
+        hidden_h = out_h[0].view(batch_size, num_chunks * chunk_size, -1)
+        hidden_b = out_b[0].view(batch_size, num_chunks * chunk_size, -1)
+        hidden_t = out_t[0].view(batch_size, num_chunks * chunk_size, -1)
+
+        f0_h = masked_mean_pool(hidden_h, mask1d)
+        f0_b = masked_mean_pool(hidden_b, mask1d)
+        f0_t = masked_mean_pool(hidden_t, mask1d)
+
+        # adapters 입력도 각 백본 pooled feature로
+        f_h     = self.adapt_h(f0_h)
+        f_t     = self.adapt_t(f0_t)
+        f_hat_b = self.adapt_b(f0_b)
+
+        # env attention은 동일
         f_b = self.env_attn(f_hat_b, f_h, f_t)
 
+        # 이후 causal classifiers 동일
         z_h, z_h_nm = self.cls_head(f_h, self.et_h)
         z_t, z_t_nm = self.cls_tail(f_t, self.et_t)
         z_b, z_b_nm = self.cls_bal(f_b, self.et_b)
+
 
         if not return_all:
             return z_b  # 기본 반환은 balanced logits로 유지

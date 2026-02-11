@@ -23,48 +23,30 @@ from transformers import RobertaModel, AutoConfig
 
 from src.models.modules.attention import LabelAttention
 import torch.nn.functional as F
-from src.losses.asl import ASLwithClassWeight
+from src.losses.mfm import MultiGrainedFocalLoss
 
 
-class LabelAttentionWithAux(LabelAttention):
+class BranchAdapter(nn.Module):
     """
-    원래 LabelAttention 로직을 그대로 쓰되,
-    - attention_mask_1d (B,L) 마스킹 지원
-    - return_aux=True면 embed_mean (B,H) 반환
+    strong adapter: LN -> (D->r->D) -> residual
     """
-    def forward(self, x: torch.Tensor, attention_mask_1d: Optional[torch.Tensor]=None, return_aux: bool=False):
-        # x: [B,L,H]
-        weights = torch.tanh(self.first_linear(x))              # [B,L,P]
-        att_logits = self.second_linear(weights)                # [B,L,C]
+    def __init__(self, dim: int, r: int = 256, dropout: float = 0.0):
+        super().__init__()
+        self.ln = nn.LayerNorm(dim)
+        self.fc1 = nn.Linear(dim, r, bias=False)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(r, dim, bias=False)
+        nn.init.zeros_(self.fc2.weight)
 
-        if attention_mask_1d is not None:
-            # mask: 1 for valid, 0 for pad
-            mask = attention_mask_1d.unsqueeze(-1).to(att_logits.dtype)  # [B,L,1]
-            # pad 위치를 -inf로
-            att_logits = att_logits.masked_fill(mask.eq(0), float("-inf"))
+    def forward(self, x):
+        h = self.ln(x)
+        h = self.fc1(h)
+        h = self.act(h)
+        h = self.drop(h)
+        h = self.fc2(h)
+        return x + h
 
-        att_weights = F.softmax(att_logits, dim=1).transpose(1, 2)       # [B,C,L]
-        weighted_output = att_weights @ x                                 # [B,C,H]
-
-        logits = (
-            self.third_linear.weight.mul(weighted_output)
-            .sum(dim=2)
-            .add(self.third_linear.bias)
-        )  # [B,C]
-
-        if not return_aux:
-            return logits
-
-        # COMIC 코드에서 필요했던 f_* (B,H)를 만들어줘야 함
-        # 가장 무난한 정의: class-wise weighted_output을 class 평균낸 벡터
-        embed_mean = weighted_output.mean(dim=1)  # [B,H]
-
-        aux = {
-            "embed_mean": embed_mean,          # [B,H]
-            "weighted_output": weighted_output # [B,C,H] (디버깅/확장용)
-        }
-        return logits, aux
-    
 # =========================================================
 # masked_softmax
 # - COMIC Eq8에서 q=1, k=2 고정이면 padding 개념이 없으니
@@ -257,7 +239,15 @@ class HeadTailBalancerLoss(nn.Module):
 
         loss = (k_h * loss_h + k_t * loss_t).mean()
         return loss
+ 
 
+def masked_mean_pool(hidden: torch.Tensor, mask1d: Optional[torch.Tensor]):
+    # hidden: (B, L, H), mask1d: (B, L) with 1 valid / 0 pad
+    if mask1d is None:
+        return hidden.mean(dim=1)
+    mask = mask1d.unsqueeze(-1).to(hidden.dtype)          # (B,L,1)
+    denom = mask.sum(dim=1).clamp(min=1.0)                # (B,1)
+    return (hidden * mask).sum(dim=1) / denom             # (B,H)
 
 class PLMICD4(nn.Module):
     def __init__(self, num_classes: int, model_path: str,
@@ -276,23 +266,29 @@ class PLMICD4(nn.Module):
         
         H = self.config.hidden_size
         self.roberta = RobertaModel(self.config, add_pooling_layer=False).from_pretrained(model_path, config=self.config)
-        
         self.roberta.gradient_checkpointing_enable()
 
-        self.attn_h = LabelAttentionWithAux(input_size=H, projection_size=H, num_classes=num_classes)
-        self.attn_t = LabelAttentionWithAux(input_size=H, projection_size=H, num_classes=num_classes)
-        self.attn_b = LabelAttentionWithAux(input_size=H, projection_size=H, num_classes=num_classes)
+        H = self.config.hidden_size
+
+        # ---- adapters (CXR처럼 3분기)
+        self.adapt_h = BranchAdapter(H, r=256, dropout=0.0)
+        self.adapt_t = BranchAdapter(H, r=256, dropout=0.0)
+        self.adapt_b = BranchAdapter(H, r=256, dropout=0.0)
+
+        # ---- env attention (Eq8)
+        self.env_attn = AdditiveEnvAttention(dim=H, num_hiddens=H, dropout=0.1, attn_scale=0.1)
+        # ---- losses
+        # MFM (balanced logits에만)
+        self.mfm = MultiGrainedFocalLoss()
+        self.mfm.create_weight(cls_num_list) 
+        self.htb_loss = HeadTailBalancerLoss(PFM=self.mfm)
       
-        self.cls_bal = BalancedCausalNormClassifier(num_classes, self.config.hidden_size)
-        self.cls_head = HeadCausalNormClassifier(num_classes, self.config.hidden_size)
-        self.cls_tail = TailCausalNormClassifier(num_classes, self.config.hidden_size)
+        self.cls_bal  = BalancedCausalNormClassifier(num_classes, H)
+        self.cls_head = HeadCausalNormClassifier(len(head_idx), H)
+        self.cls_tail = TailCausalNormClassifier(len(tail_idx), H) 
 
         self.env_attn = AdditiveEnvAttention(dim=H, num_hiddens=H, dropout=0.1, attn_scale=0.1)
         
-        n_train = float(89098) # 110441
-        self.loss = ASLwithClassWeight(cls_num_list, n_train)  # (C,)
-        self.htb_loss = HeadTailBalancerLoss()
-        self.htb_loss.PFM = self.loss
         self.mu = 0.9
         self.register_buffer("et_b", torch.zeros(H), persistent=True)
         self.register_buffer("et_h", torch.zeros(H), persistent=True)
@@ -300,11 +296,16 @@ class PLMICD4(nn.Module):
         
     def get_loss(self, z_b, z_h, z_t, z_h_hat, z_t_hat, targets):
         loss_main = self.loss(z_b, targets)
-        loss_h = self.loss(z_h, targets)
-        loss_t = self.loss(z_t, targets)
         loss_htb = self.htb_loss(z_h_hat, z_t_hat, z_b, targets)
-        return loss_main + (loss_main + loss_h + loss_t) / 3.0 + loss_htb      
-
+        return loss_main + loss_htb     
+        
+    def _scatter(self, part_logits: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+        # part_logits: (B, |idx|)
+        B = part_logits.size(0)
+        full = part_logits.new_zeros(B, self.num_classes)  # (B, C)
+        full.index_copy_(1, idx, part_logits)
+        return full
+    
     def training_step(self, batch) -> dict[str, torch.Tensor]:
         data, targets, attention_mask = batch.data, batch.targets, batch.attention_mask
         out = self.forward(data, attention_mask, return_all=True)
@@ -346,17 +347,23 @@ class PLMICD4(nn.Module):
             return_dict=False,
         )
         hidden = out[0].view(batch_size, num_chunks * chunk_size, -1)  # [B, L, H]
+        f0 = masked_mean_pool(hidden, mask1d)
         
-        laat_h, aux_h = self.attn_h(hidden, attention_mask_1d=mask1d, return_aux=True)
-        laat_t, aux_t = self.attn_t(hidden, attention_mask_1d=mask1d, return_aux=True)
-        laat_b, aux_b = self.attn_b(hidden, attention_mask_1d=mask1d, return_aux=True)
+        f_h = self.adapt_h(f0)
+        f_t = self.adapt_t(f0)
+        f_hat_b = self.adapt_b(f0)
  
-        f_h, f_t, f_hat_b = aux_h["embed_mean"], aux_t["embed_mean"], aux_b["embed_mean"]
         f_b = self.env_attn(f_hat_b, f_h, f_t)
+        
+        z_h_part, z_h_nm_part = self.cls_head(f_h, self.et_h)  # (B, |H|)
+        z_t_part, z_t_nm_part = self.cls_tail(f_t, self.et_t)  # (B, |T|)
 
-        z_h, z_h_nm = self.cls_head(f_h, self.et_h)
-        z_t, z_t_nm = self.cls_tail(f_t, self.et_t)
-        z_b, z_b_nm = self.cls_bal(f_b, self.et_b)
+        z_h    = self._scatter(z_h_part,    self.head_idx)
+        z_h_nm = self._scatter(z_h_nm_part, self.head_idx)
+        z_t    = self._scatter(z_t_part,    self.tail_idx)
+        z_t_nm = self._scatter(z_t_nm_part, self.tail_idx)
+
+        z_b, z_b_nm = self.cls_bal(f_b, self.et_b)             # (B, C)
 
         if not return_all:
             return z_b  # 기본 반환은 balanced logits로 유지
@@ -365,6 +372,5 @@ class PLMICD4(nn.Module):
             "z_b": z_b, "z_h": z_h, "z_t": z_t,
             "z_b_nm": z_b_nm, "z_h_nm": z_h_nm, "z_t_nm": z_t_nm,
             "embed_mean_b": f_hat_b, "embed_mean_h": f_h, "embed_mean_t": f_t,
-            "laat_logits_b": laat_b, "laat_logits_h": laat_h, "laat_logits_t": laat_t,
         }
     

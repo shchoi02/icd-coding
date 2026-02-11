@@ -1,6 +1,6 @@
 # @package _global_
 defaults:
-  - override /model: plm_icd4
+  - override /model: plm_icd6
   - override /text_encoder: defaults
   - override /data: mimiciv_icd10
   - override /lr_scheduler: warmup_linear_decay
@@ -9,9 +9,9 @@ defaults:
   - override /optimizer: adamw
   - override /callbacks: mean_average_precision
   
-  
+
 dataloader: 
-  max_batch_size: 16
+  max_batch_size: 4
   batch_size: 16
 
 optimizer:
