@@ -284,8 +284,8 @@ class PLMICD6(nn.Module):
         self.htb_loss = HeadTailBalancerLoss(PFM=self.mfm)
       
         self.cls_bal  = BalancedCausalNormClassifier(num_classes, H)
-        self.cls_head = HeadCausalNormClassifier(num_classes, H)
-        self.cls_tail = TailCausalNormClassifier(num_classes, H) 
+        self.cls_head = HeadCausalNormClassifier(len(head_idx), H)
+        self.cls_tail = TailCausalNormClassifier(len(tail_idx), H)  
 
         self.env_attn = AdditiveEnvAttention(dim=H, num_hiddens=H, dropout=0.1, attn_scale=0.1)
         
@@ -294,10 +294,17 @@ class PLMICD6(nn.Module):
         self.register_buffer("et_h", torch.zeros(H), persistent=True)
         self.register_buffer("et_t", torch.zeros(H), persistent=True)
         
+    def _scatter(self, part_logits: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+        # part_logits: (B, |idx|)
+        B = part_logits.size(0)
+        full = part_logits.new_zeros(B, self.num_classes)  # (B, C)
+        full.index_copy_(1, idx, part_logits)
+        return full
+    
     def get_loss(self, z_b, z_h, z_t, z_h_hat, z_t_hat, targets):
-        loss_main = self.loss(z_b, targets)
+        loss_main = self.mfm(z_b, targets)
         loss_htb = self.htb_loss(z_h_hat, z_t_hat, z_b, targets)
-        return loss_main + loss_htb     
+        return loss_main + loss_htb        
         
 
     def training_step(self, batch) -> dict[str, torch.Tensor]:
@@ -315,9 +322,10 @@ class PLMICD6(nn.Module):
 
     def validation_step(self, batch) -> dict[str, torch.Tensor]:
         data, targets, attention_mask = batch.data, batch.targets, batch.attention_mask
-        logits = self(data, attention_mask)
-        loss = self.loss(logits, targets)
-        logits = torch.sigmoid(logits)
+        out = self.forward(data, attention_mask, return_all=True)
+        z_b, z_h, z_t, z_h_hat, z_t_hat = out["z_b"], out["z_h"], out["z_t"], out["z_h_nm"], out["z_t_nm"]
+        loss = self.get_loss(z_b, z_h, z_t, z_h_hat, z_t_hat, targets)
+        logits = torch.sigmoid(z_b)
         return {"logits": logits, "loss": loss, "targets": targets}
 
     def forward(
@@ -356,11 +364,15 @@ class PLMICD6(nn.Module):
         # env attention은 동일
         f_b = self.env_attn(f_hat_b, f_h, f_t)
 
-        # 이후 causal classifiers 동일
-        z_h, z_h_nm = self.cls_head(f_h, self.et_h)
-        z_t, z_t_nm = self.cls_tail(f_t, self.et_t)
-        z_b, z_b_nm = self.cls_bal(f_b, self.et_b)
+        z_h_part, z_h_nm_part = self.cls_head(f_h, self.et_h)  # (B, |H|)
+        z_t_part, z_t_nm_part = self.cls_tail(f_t, self.et_t)  # (B, |T|)
 
+        z_h    = self._scatter(z_h_part,    self.head_idx)      # (B, C)
+        z_h_nm = self._scatter(z_h_nm_part, self.head_idx)      # (B, C)
+        z_t    = self._scatter(z_t_part,    self.tail_idx)      # (B, C)
+        z_t_nm = self._scatter(z_t_nm_part, self.tail_idx)      # (B, C)
+
+        z_b, z_b_nm = self.cls_bal(f_b, self.et_b)              # (B, C)
 
         if not return_all:
             return z_b  # 기본 반환은 balanced logits로 유지

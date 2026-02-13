@@ -18,7 +18,7 @@ from src.models import BaseModel
 from src.settings import ID_COLUMN, TARGET_COLUMN
 from src.trainer.callbacks import BaseCallback
 from src.utils.decision_boundary import f1_score_db_tuning
-# from src.utils.visualize import plot_per_class_best_threshold
+from src.utils.visualize import plot_threshold_collapse_hmt
 
 
 class Trainer:
@@ -283,6 +283,7 @@ class Trainer:
             #     targets=targets,
             #     label_transform=self.label_transform
             # )
+            # plot_threshold_collapse_hmt(logits=logits, targets=targets, label_transform=self.label_transform)
 
 
     def save_predictions(
@@ -377,7 +378,7 @@ class Trainer:
 
     def load_checkpoint(self, file_name: str) -> None:
         checkpoint = torch.load(self.experiment_path / file_name)
-        self.model.load_state_dict(checkpoint["model"])
+        self.model.load_state_dict(checkpoint["model"], strict=False) # 수정
         self.optimizer.load_state_dict(checkpoint["optimizer"])
         self.gradient_scaler.load_state_dict(checkpoint["scaler"])
         self.epoch = checkpoint["epoch"]

@@ -295,7 +295,7 @@ class PLMICD4(nn.Module):
         self.register_buffer("et_t", torch.zeros(H), persistent=True)
         
     def get_loss(self, z_b, z_h, z_t, z_h_hat, z_t_hat, targets):
-        loss_main = self.loss(z_b, targets)
+        loss_main = self.mfm(z_b, targets)
         loss_htb = self.htb_loss(z_h_hat, z_t_hat, z_b, targets)
         return loss_main + loss_htb     
         
@@ -321,9 +321,10 @@ class PLMICD4(nn.Module):
 
     def validation_step(self, batch) -> dict[str, torch.Tensor]:
         data, targets, attention_mask = batch.data, batch.targets, batch.attention_mask
-        logits = self(data, attention_mask)
-        loss = self.loss(logits, targets)
-        logits = torch.sigmoid(logits)
+        out = self.forward(data, attention_mask, return_all=True)
+        z_b, z_h, z_t, z_h_hat, z_t_hat = out["z_b"], out["z_h"], out["z_t"], out["z_h_nm"], out["z_t_nm"]
+        loss = self.get_loss(z_b, z_h, z_t, z_h_hat, z_t_hat, targets)
+        logits = torch.sigmoid(z_b)
         return {"logits": logits, "loss": loss, "targets": targets}
 
     def forward(

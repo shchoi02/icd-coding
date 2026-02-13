@@ -162,7 +162,7 @@ class HeadCausalNormClassifier(_CausalNormBase):
         y_head = torch.mm(normed_x * self.scale, normed_w.t())
         y_head_nomoving = y_head.clone()
 
-        if self.use_effect and embed is not None:
+        if self.use_effect and embed is not None: # no로 적용해서 돌려보기
             if isinstance(embed, torch.Tensor):
                 c = embed.view(1, -1).to(x.device, dtype=x.dtype)
             else:
@@ -285,6 +285,7 @@ class PLMICD3(nn.Module):
         self.htb_loss = HeadTailBalancerLoss(PFM=self.mfm)
       
         self.cls_bal  = BalancedCausalNormClassifier(num_classes, H)
+        # 수정
         self.cls_head = HeadCausalNormClassifier(num_classes, H)
         self.cls_tail = TailCausalNormClassifier(num_classes, H) 
 
@@ -296,7 +297,7 @@ class PLMICD3(nn.Module):
         self.register_buffer("et_t", torch.zeros(H), persistent=True)
         
     def get_loss(self, z_b, z_h, z_t, z_h_hat, z_t_hat, targets):
-        loss_main = self.loss(z_b, targets)
+        loss_main = self.mfm(z_b, targets)
         loss_htb = self.htb_loss(z_h_hat, z_t_hat, z_b, targets)
         return loss_main + loss_htb     
         
@@ -316,9 +317,10 @@ class PLMICD3(nn.Module):
 
     def validation_step(self, batch) -> dict[str, torch.Tensor]:
         data, targets, attention_mask = batch.data, batch.targets, batch.attention_mask
-        logits = self(data, attention_mask)
-        loss = self.loss(logits, targets)
-        logits = torch.sigmoid(logits)
+        out = self.forward(data, attention_mask, return_all=True)
+        z_b, z_h, z_t, z_h_hat, z_t_hat = out["z_b"], out["z_h"], out["z_t"], out["z_h_nm"], out["z_t_nm"]
+        loss = self.get_loss(z_b, z_h, z_t, z_h_hat, z_t_hat, targets)
+        logits = torch.sigmoid(z_b)
         return {"logits": logits, "loss": loss, "targets": targets}
 
     def forward(
@@ -346,9 +348,10 @@ class PLMICD3(nn.Module):
         
         f_h = self.adapt_h(f0)
         f_t = self.adapt_t(f0)
-        f_hat_b = self.adapt_b(f0)
+        # f_hat_b = self.adapt_b(f0)
+        f_b = self.adapt_b(f0)
  
-        f_b = self.env_attn(f_hat_b, f_h, f_t)
+        # f_b = self.env_attn(f_hat_b, f_h, f_t)
 
         z_h, z_h_nm = self.cls_head(f_h, self.et_h)
         z_t, z_t_nm = self.cls_tail(f_t, self.et_t)
@@ -360,6 +363,6 @@ class PLMICD3(nn.Module):
         return {
             "z_b": z_b, "z_h": z_h, "z_t": z_t,
             "z_b_nm": z_b_nm, "z_h_nm": z_h_nm, "z_t_nm": z_t_nm,
-            "embed_mean_b": f_hat_b, "embed_mean_h": f_h, "embed_mean_t": f_t,
+            "embed_mean_b": f_b, "embed_mean_h": f_h, "embed_mean_t": f_t,
         }
     

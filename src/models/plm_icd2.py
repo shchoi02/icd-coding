@@ -109,7 +109,7 @@ class PLMICD2(nn.Module):
         #     reweight_func  ='rebalance',
         # )
         
-        # self.rlc = ReflectiveLabelCorrectorLoss(num_classes=num_classes, distribution=cls_num_list)
+        self.rlc = ReflectiveLabelCorrectorLoss(num_classes=num_classes, distribution=cls_num_list)
         
         # self.pfm = PriorFocalModifierLoss()
         # self.pfm.create_co_occurrence_matrix(co_occurrence_matrix)
@@ -139,7 +139,7 @@ class PLMICD2(nn.Module):
     #     return head_m, tail_m, bal_m, labels_m
  
     def _composite_loss(self, head, tail, bal, labels):
-        # loss_r = self.rlc(bal, labels)
+        loss_r = self.rlc(bal, labels)
         loss_m = self.mfm(bal, labels)          
         loss_b = self.htb(head, tail, bal, labels) 
         # return loss_r
@@ -147,7 +147,8 @@ class PLMICD2(nn.Module):
         # return self.lambda_r * loss_r + self.lambda_m * loss_m   
         # return self.lambda_m * loss_m + self.lambda_b * loss_b
         # return self.lambda_r * loss_r + self.lambda_b * loss_b
-        return self.lambda_m * loss_m + self.lambda_b * loss_b
+        # return self.lambda_m * loss_m + self.lambda_b * loss_b
+        return self.lambda_r * loss_r + self.lambda_m * loss_m + self.lambda_b * loss_b
 
     def get_loss(self, head, tail, bal, targets):
         return self._composite_loss(head, tail, bal, targets)

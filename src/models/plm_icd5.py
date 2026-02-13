@@ -60,8 +60,8 @@ class PLMICD5(nn.Module):
         self.att_head = LabelAttention(
             input_size=self.config.hidden_size,
             projection_size=self.config.hidden_size,
-            # num_classes=num_classes
-            num_classes=len(head_idx),
+            num_classes=num_classes
+            # num_classes=len(head_idx),
         )
         self.att_bal = LabelAttention(
             input_size=self.config.hidden_size,
@@ -71,8 +71,8 @@ class PLMICD5(nn.Module):
         self.att_tail = LabelAttention(
             input_size=self.config.hidden_size,
             projection_size=self.config.hidden_size,
-            num_classes=len(tail_idx),
-            # num_classes=num_classes
+            # num_classes=len(tail_idx),
+            num_classes=num_classes
         )
         
         self.register_buffer("head_idx", torch.tensor(head_idx))
@@ -139,7 +139,7 @@ class PLMICD5(nn.Module):
         logits_bal  = self.att_bal(hidden_b)
         logits_tail = self.att_tail(hidden_t)
 
-        logits_head = self._scatter(logits_head, self.head_idx)
-        logits_tail = self._scatter(logits_tail, self.tail_idx)
+        # logits_head = self._scatter(logits_head, self.head_idx)
+        # logits_tail = self._scatter(logits_tail, self.tail_idx)
 
         return logits_head, logits_tail, logits_bal
