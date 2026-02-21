@@ -60,8 +60,8 @@ class PLMICD5(nn.Module):
         self.att_head = LabelAttention(
             input_size=self.config.hidden_size,
             projection_size=self.config.hidden_size,
-            num_classes=num_classes
-            # num_classes=len(head_idx),
+            # num_classes=num_classes
+            num_classes=len(head_idx),
         )
         self.att_bal = LabelAttention(
             input_size=self.config.hidden_size,
@@ -71,24 +71,25 @@ class PLMICD5(nn.Module):
         self.att_tail = LabelAttention(
             input_size=self.config.hidden_size,
             projection_size=self.config.hidden_size,
-            # num_classes=len(tail_idx),
-            num_classes=num_classes
+            num_classes=len(tail_idx),
+            # num_classes=num_classes
         )
         
         self.register_buffer("head_idx", torch.tensor(head_idx))
         self.register_buffer("tail_idx", torch.tensor(tail_idx))
         self.num_classes = num_classes
 
-        
+        self.rlc = ReflectiveLabelCorrectorLoss(num_classes=num_classes, distribution=cls_num_list)
         self.mfm = MultiGrainedFocalLoss()
         self.mfm.create_weight(cls_num_list) 
         self.htb = HeadTailBalancerLoss(PFM=self.mfm)
     
  
     def _composite_loss(self, head, tail, bal, labels):
+        loss_r = self.rlc(bal, labels)
         loss_m = self.mfm(bal, labels)          
         loss_b = self.htb(head, tail, bal, labels) 
-        return self.lambda_m * loss_m + self.lambda_b * loss_b
+        return 0.2 * loss_r + self.lambda_m * loss_m + self.lambda_b * loss_b
 
     def get_loss(self, head, tail, bal, targets):
         return self._composite_loss(head, tail, bal, targets)
@@ -139,7 +140,7 @@ class PLMICD5(nn.Module):
         logits_bal  = self.att_bal(hidden_b)
         logits_tail = self.att_tail(hidden_t)
 
-        # logits_head = self._scatter(logits_head, self.head_idx)
-        # logits_tail = self._scatter(logits_tail, self.tail_idx)
+        logits_head = self._scatter(logits_head, self.head_idx)
+        logits_tail = self._scatter(logits_tail, self.tail_idx)
 
         return logits_head, logits_tail, logits_bal

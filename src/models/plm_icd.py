@@ -117,52 +117,11 @@ class PLMICD(nn.Module):
             num_classes=num_classes,
         )
         
-        # --- class_mask / pos_weight 안전 계산 ---
-        # cf  = torch.as_tensor(class_freq,     dtype=torch.float32)
-        # ncf = torch.as_tensor(neg_class_freq, dtype=torch.float32)
-
-        # # class_mask: train에서 양성 0인 클래스는 마스킹(평가 보존은 손실 모듈 옵션으로 결정)
-        # if cf is not None:
-        #     class_mask = (cf > 0).to(torch.float32)  # shape: (C,)
-        # else:
-        #     class_mask = torch.ones(num_classes, dtype=torch.float32)
-
-        # # pos_weight: neg/pos with clamp (pos=0 보호 + 과대값 캡)
-        # pw = None
-        # if (cf is not None) and (ncf is not None):
-        #     eps, cap = 1.0, 1e4
-        #     pw = torch.clamp(ncf / torch.clamp(cf, min=eps), max=cap)  # shape: (C,)
-
-        # # 모양/개수 확인(디버그 시 유용)
-        # assert class_mask.shape[0] == num_classes
-        # if pw is not None:
-        #     assert pw.shape[0] == num_classes
-
-        # # --- 손실 모듈 장착(여기가 pos_weight의 "집") ---
-        # self.loss = MaskedBCEWithLogits(
-        #     pos_weight=pw,
-        #     class_mask=class_mask,
-        #     apply_mask_in_val=False,
-        # )
-        # loss = MultiGrainedFocalLoss()
-        # loss.create_weight(cls_num_list)
-        # self.loss = MaskedReduction(
-        #     # base_loss=Ralloss(gamma_neg=4, gamma_pos=0, clip=0.05,
-        #     #                 eps=1e-8, lamb=1.5, epsilon_neg=0.0,
-        #     #                 epsilon_pos=1.0, epsilon_pos_pow=-2.5),
-        #     # base_loss=APLLoss(),
-        #     base_loss=BCEWithLogits_Clamped(),
-        #     # base_loss=loss,
-        #     # base_loss=AsymmetricLoss(),
-        #     class_mask=class_mask,
-        #     apply_mask_in_val=False,   # 평가 시엔 마스크 미적용(원래 분포 유지)
-        # )
-        
         # self.loss = torch.nn.functional.binary_cross_entropy_with_logits
         
         # self.loss = Hill()
         
-        self.loss = FocalLoss()
+        # self.loss = FocalLoss()
         
         # self.loss = ResampleLoss( # CB Loss
         #     use_sigmoid=True,                 
@@ -171,12 +130,12 @@ class PLMICD(nn.Module):
         #     neg_class_freq=neg_class_freq
         # )
                       
-        # self.loss = ResampleLoss(
-        #     use_sigmoid    = True,
-        #     class_freq     = class_freq,
-        #     neg_class_freq = neg_class_freq,
-        #     reweight_func  ='rebalance',
-        # )
+        self.loss = ResampleLoss(
+            use_sigmoid    = True,
+            class_freq     = class_freq,
+            neg_class_freq = neg_class_freq,
+            reweight_func  ='rebalance',
+        )
 
         # self.loss = AsymmetricLoss()
         
@@ -226,25 +185,15 @@ class PLMICD(nn.Module):
         input_ids (torch.LongTensor of shape (batch_size, num_chunks, chunk_size))
         labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size, num_labels)`, `optional`):
         """
-        # 입력 무결성 (필요 최소한)
-        # assert input_ids is not None
-        # B, NC, CS = input_ids.size()
-        # assert torch.isfinite(input_ids).all(), "NaN/Inf in input_ids"
-        # assert (input_ids >= 0).all() and (input_ids < self.config.vocab_size).all(), "input_ids out of range"
-        # if attention_mask is not None:
-        #     valid = attention_mask.view(B, -1).sum(dim=1)
-        #     if (valid == 0).any():
-        #         bad = (valid == 0).nonzero(as_tuple=True)[0]
-        #         attention_mask[bad, 0, 0] = 1  # all-pad 가드
                 
         batch_size, num_chunks, chunk_size = input_ids.size()
-        with torch.cuda.amp.autocast(enabled=False):
-            outputs = self.roberta(
-                input_ids.view(-1, chunk_size),
-                attention_mask=attention_mask.view(-1, chunk_size)
-                if attention_mask is not None
-                else None,
-                return_dict=False,
+        # with torch.cuda.amp.autocast(enabled=False):
+        outputs = self.roberta(
+            input_ids.view(-1, chunk_size),
+            attention_mask=attention_mask.view(-1, chunk_size)
+            if attention_mask is not None
+            else None,
+            return_dict=False,
             )
         hidden_output = outputs[0].view(batch_size, num_chunks * chunk_size, -1)
         # assert torch.isfinite(hidden_output).all(), "NaN/Inf before LabelAttention"

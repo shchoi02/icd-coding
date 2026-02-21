@@ -18,7 +18,7 @@ defaults:
 
 hydra:
   output_subdir: null
-seed: 1337
+seed: 1335
 deterministic: false
 gpu:
   - 6

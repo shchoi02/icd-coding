@@ -21,32 +21,12 @@ from typing import Optional
 
 from transformers import RobertaModel, AutoConfig
 
-from src.models.modules.attention import LabelAttention
+from src.models.modules.attention import LabelAttentionBalanced, LabelAttentionHead, LabelAttentionTail, BalancedCausalNormVec
 import torch.nn.functional as F
 from src.losses.mfm import MultiGrainedFocalLoss
+from src.losses.rlc import ReflectiveLabelCorrectorLoss
 
-
-class BranchAdapter(nn.Module):
-    """
-    strong adapter: LN -> (D->r->D) -> residual
-    """
-    def __init__(self, dim: int, r: int = 256, dropout: float = 0.0):
-        super().__init__()
-        self.ln = nn.LayerNorm(dim)
-        self.fc1 = nn.Linear(dim, r, bias=False)
-        self.act = nn.GELU()
-        self.drop = nn.Dropout(dropout)
-        self.fc2 = nn.Linear(r, dim, bias=False)
-        nn.init.zeros_(self.fc2.weight)
-
-    def forward(self, x):
-        h = self.ln(x)
-        h = self.fc1(h)
-        h = self.act(h)
-        h = self.drop(h)
-        h = self.fc2(h)
-        return x + h
-
+    
 # =========================================================
 # masked_softmax
 # - COMIC Eq8에서 q=1, k=2 고정이면 padding 개념이 없으니
@@ -92,127 +72,6 @@ class AdditiveEnvAttention(nn.Module):
         kv = torch.stack([f_h, f_t], dim=1)  # [B,2,D]
         ctx = self.attn(q, kv, kv).squeeze(1)  # [B,D]
         return f_hat_b + self.attn_scale * ctx
-    
-class _CausalNormBase(nn.Module):
-    def __init__(self, num_classes, feat_dim, use_effect=True, num_head=1, tau=16.0, alpha=2.0, gamma=0.03125):
-        super().__init__()
-        self.weight = nn.Parameter(torch.empty(num_classes, feat_dim), requires_grad=True)
-        self.num_classes = num_classes
-        self.feat_dim = feat_dim
-
-        self.num_head = int(num_head)
-        self.head_dim = feat_dim // self.num_head
-
-        self.scale = float(tau) / float(self.num_head)
-        self.norm_scale = float(gamma)
-        self.alpha = float(alpha)
-        self.use_effect = bool(use_effect)
-
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        stdv = 1.0 / math.sqrt(self.weight.size(1))
-        with torch.no_grad():
-            self.weight.uniform_(-stdv, stdv)
-
-    def l2_norm(self, x):
-        return x / (torch.norm(x, 2, 1, keepdim=True) + 1e-12)
-
-    def causal_norm(self, x, weight):
-        norm = torch.norm(x, 2, 1, keepdim=True)
-        return x / (norm + weight)
-
-    def get_cos(self, x, y):
-        # x,y: [B,D]
-        return (x * y).sum(-1, keepdim=True) / (
-            (torch.norm(x, 2, 1, keepdim=True) + 1e-12) * (torch.norm(y, 2, 1, keepdim=True) + 1e-12)
-        )
-
-    def multi_head_call(self, func, x, weight=None):
-        assert x.dim() == 2
-        xs = torch.split(x, self.head_dim, dim=1)
-        if weight is not None:
-            ys = [func(t, weight) for t in xs]
-        else:
-            ys = [func(t) for t in xs]
-        return torch.cat(ys, dim=1)
-
-
-class BalancedCausalNormClassifier(_CausalNormBase):
-    """
-    balanced: y_b = (normed_x * scale) @ normed_w^T
-    (네가 올린 balanced 버전: effect block이 주석 처리된 형태)
-    """
-    def forward(self, x, embed=None):
-        # x: [B,D], embed: [D] or [1,D] (있어도 안 씀)
-        normed_w = self.multi_head_call(self.causal_norm, self.weight, weight=self.norm_scale)
-        normed_x = self.multi_head_call(self.l2_norm, x)
-        y_b = torch.mm(normed_x * self.scale, normed_w.t())
-        y_b_nomoving = y_b.clone()
-        return y_b, y_b_nomoving
-
-
-class HeadCausalNormClassifier(_CausalNormBase):
-    """
-    head: y_head_nomoving = sum( (nx - cos*nc) * scale @ nw^T )
-    """
-    def forward(self, x, embed):
-        normed_w = self.multi_head_call(self.causal_norm, self.weight, weight=self.norm_scale)
-        normed_x = self.multi_head_call(self.l2_norm, x)
-        y_head = torch.mm(normed_x * self.scale, normed_w.t())
-        y_head_nomoving = y_head.clone()
-
-        if self.use_effect and embed is not None:
-            if isinstance(embed, torch.Tensor):
-                c = embed.view(1, -1).to(x.device, dtype=x.dtype)
-            else:
-                raise TypeError("embed must be torch.Tensor")
-
-            normed_c = self.multi_head_call(self.l2_norm, c)  # [1,D]
-            x_list = torch.split(normed_x, self.head_dim, dim=1)
-            c_list = torch.split(normed_c, self.head_dim, dim=1)
-            w_list = torch.split(normed_w, self.head_dim, dim=1)
-
-            outs = []
-            for nx, nc, nw in zip(x_list, c_list, w_list):
-                cos_val = self.get_cos(nx, nc)  # [B,1]
-                y_temp = torch.mm((nx - cos_val * nc) * self.scale, nw.t())
-                outs.append(y_temp)
-            y_head_nomoving = sum(outs)
-
-        return y_head, y_head_nomoving
-
-
-class TailCausalNormClassifier(_CausalNormBase):
-    """
-    tail: y_tail_nomoving = sum( (nx + alpha*cos*nc) * scale @ nw^T )
-    """
-    def forward(self, x, embed):
-        normed_w = self.multi_head_call(self.causal_norm, self.weight, weight=self.norm_scale)
-        normed_x = self.multi_head_call(self.l2_norm, x)
-        y_tail = torch.mm(normed_x * self.scale, normed_w.t())
-        y_tail_nomoving = y_tail.clone()
-
-        if self.use_effect and embed is not None:
-            if isinstance(embed, torch.Tensor):
-                c = embed.view(1, -1).to(x.device, dtype=x.dtype)
-            else:
-                raise TypeError("embed must be torch.Tensor")
-
-            normed_c = self.multi_head_call(self.l2_norm, c)  # [1,D]
-            x_list = torch.split(normed_x, self.head_dim, dim=1)
-            c_list = torch.split(normed_c, self.head_dim, dim=1)
-            w_list = torch.split(normed_w, self.head_dim, dim=1)
-
-            outs = []
-            for nx, nc, nw in zip(x_list, c_list, w_list):
-                cos_val = self.get_cos(nx, nc)  # [B,1]
-                y_temp = torch.mm((nx + cos_val * self.alpha * nc) * self.scale, nw.t())
-                outs.append(y_temp)
-            y_tail_nomoving = sum(outs)
-
-        return y_tail, y_tail_nomoving
-    
 
 class HeadTailBalancerLoss(nn.Module):
     def __init__(self, gamma=2, PFM=None):
@@ -239,15 +98,7 @@ class HeadTailBalancerLoss(nn.Module):
 
         loss = (k_h * loss_h + k_t * loss_t).mean()
         return loss
- 
 
-def masked_mean_pool(hidden: torch.Tensor, mask1d: Optional[torch.Tensor]):
-    # hidden: (B, L, H), mask1d: (B, L) with 1 valid / 0 pad
-    if mask1d is None:
-        return hidden.mean(dim=1)
-    mask = mask1d.unsqueeze(-1).to(hidden.dtype)          # (B,L,1)
-    denom = mask.sum(dim=1).clamp(min=1.0)                # (B,1)
-    return (hidden * mask).sum(dim=1) / denom             # (B,H)
 
 class PLMICD4(nn.Module):
     def __init__(self, num_classes: int, model_path: str,
@@ -266,63 +117,51 @@ class PLMICD4(nn.Module):
         
         H = self.config.hidden_size
         self.roberta = RobertaModel(self.config, add_pooling_layer=False).from_pretrained(model_path, config=self.config)
+        
         self.roberta.gradient_checkpointing_enable()
 
-        H = self.config.hidden_size
-
-        # ---- adapters (CXR처럼 3분기)
-        self.adapt_h = BranchAdapter(H, r=256, dropout=0.0)
-        self.adapt_t = BranchAdapter(H, r=256, dropout=0.0)
-        self.adapt_b = BranchAdapter(H, r=256, dropout=0.0)
-
-        # ---- env attention (Eq8)
-        self.env_attn = AdditiveEnvAttention(dim=H, num_hiddens=H, dropout=0.1, attn_scale=0.1)
-        # ---- losses
-        # MFM (balanced logits에만)
-        self.mfm = MultiGrainedFocalLoss()
-        self.mfm.create_weight(cls_num_list) 
-        self.htb_loss = HeadTailBalancerLoss(PFM=self.mfm)
+        self.attn_h = LabelAttentionHead(input_size=H, projection_size=H, num_classes=num_classes)
+        self.attn_t = LabelAttentionTail(input_size=H, projection_size=H, num_classes=num_classes)
+        self.attn_b = LabelAttentionBalanced(input_size=H, projection_size=H, num_classes=num_classes)
       
-        self.cls_bal  = BalancedCausalNormClassifier(num_classes, H)
-        self.cls_head = HeadCausalNormClassifier(len(head_idx), H)
-        self.cls_tail = TailCausalNormClassifier(len(tail_idx), H) 
-
         self.env_attn = AdditiveEnvAttention(dim=H, num_hiddens=H, dropout=0.1, attn_scale=0.1)
-        
+        self.cls_bal_vec = BalancedCausalNormVec(num_classes, H, use_effect=False)
+       
+        # MFM (balanced logits에만)
+        self.rlc = ReflectiveLabelCorrectorLoss(num_classes=num_classes, distribution=cls_num_list)
+        self.loss = MultiGrainedFocalLoss()
+        self.loss.create_weight(cls_num_list) 
+        self.htb_loss = HeadTailBalancerLoss(PFM=self.loss)
         self.mu = 0.9
         self.register_buffer("et_b", torch.zeros(H), persistent=True)
         self.register_buffer("et_h", torch.zeros(H), persistent=True)
         self.register_buffer("et_t", torch.zeros(H), persistent=True)
         
     def get_loss(self, z_b, z_h, z_t, z_h_hat, z_t_hat, targets):
-        loss_main = self.mfm(z_b, targets)
+        loss_rlc = self.rlc(z_b, targets)
+        loss_main = self.loss(z_b, targets)
         loss_htb = self.htb_loss(z_h_hat, z_t_hat, z_b, targets)
-        return loss_main + loss_htb     
-        
-    def _scatter(self, part_logits: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-        # part_logits: (B, |idx|)
-        B = part_logits.size(0)
-        full = part_logits.new_zeros(B, self.num_classes)  # (B, C)
-        full.index_copy_(1, idx, part_logits)
-        return full
-    
+        return 0.2 * loss_rlc + loss_main + loss_htb      
+
     def training_step(self, batch) -> dict[str, torch.Tensor]:
         data, targets, attention_mask = batch.data, batch.targets, batch.attention_mask
         out = self.forward(data, attention_mask, return_all=True)
         z_b, z_h, z_t, z_h_hat, z_t_hat = out["z_b"], out["z_h"], out["z_t"], out["z_h_nm"], out["z_t_nm"]
         loss = self.get_loss(z_b, z_h, z_t, z_h_hat, z_t_hat, targets)
         with torch.no_grad():
-            self.et_b.mul_(self.mu).add_((1.0 - self.mu) * out["embed_mean_b"].detach().mean(0))
-            self.et_h.mul_(self.mu).add_((1.0 - self.mu) * out["embed_mean_h"].detach().mean(0))
-            self.et_t.mul_(self.mu).add_((1.0 - self.mu) * out["embed_mean_t"].detach().mean(0))
+            self.et_b.mul_(self.mu).add_((1.0 - self.mu) * out["feat_b"].detach().mean(0))
+            self.et_h.mul_(self.mu).add_((1.0 - self.mu) * out["feat_h"].detach().mean(0))
+            self.et_t.mul_(self.mu).add_((1.0 - self.mu) * out["feat_t"].detach().mean(0))
         probs = torch.sigmoid(z_b).detach()
         return {"logits": probs, "loss": loss, "targets": targets}
 
 
-    def validation_step(self, batch) -> dict[str, torch.Tensor]:
+    def validation_step(self, batch):
         data, targets, attention_mask = batch.data, batch.targets, batch.attention_mask
         out = self.forward(data, attention_mask, return_all=True)
-        z_b, z_h, z_t, z_h_hat, z_t_hat = out["z_b"], out["z_h"], out["z_t"], out["z_h_nm"], out["z_t_nm"]
+        z_b, z_h, z_t = out["z_b"], out["z_h"], out["z_t"]
+        z_h_hat, z_t_hat = out["z_h_nm"], out["z_t_nm"]
+
         loss = self.get_loss(z_b, z_h, z_t, z_h_hat, z_t_hat, targets)
         logits = torch.sigmoid(z_b)
         return {"logits": logits, "loss": loss, "targets": targets}
@@ -348,30 +187,22 @@ class PLMICD4(nn.Module):
             return_dict=False,
         )
         hidden = out[0].view(batch_size, num_chunks * chunk_size, -1)  # [B, L, H]
-        f0 = masked_mean_pool(hidden, mask1d)
         
-        f_h = self.adapt_h(f0)
-        f_t = self.adapt_t(f0)
-        f_hat_b = self.adapt_b(f0)
- 
+        # head/tail/bal logits + embed_mean 받기
+        z_h, z_h_nm, f_h = self.attn_h(hidden, attention_mask_1d=mask1d, embed=self.et_h)
+        z_t, z_t_nm, f_t = self.attn_t(hidden, attention_mask_1d=mask1d, embed=self.et_t)
+        z_b, z_b_nm, f_hat_b = self.attn_b(hidden, attention_mask_1d=mask1d, embed=None)
+        
         f_b = self.env_attn(f_hat_b, f_h, f_t)
-        
-        z_h_part, z_h_nm_part = self.cls_head(f_h, self.et_h)  # (B, |H|)
-        z_t_part, z_t_nm_part = self.cls_tail(f_t, self.et_t)  # (B, |T|)
-
-        z_h    = self._scatter(z_h_part,    self.head_idx)
-        z_h_nm = self._scatter(z_h_nm_part, self.head_idx)
-        z_t    = self._scatter(z_t_part,    self.tail_idx)
-        z_t_nm = self._scatter(z_t_nm_part, self.tail_idx)
-
-        z_b, z_b_nm = self.cls_bal(f_b, self.et_b)             # (B, C)
+        z_b, z_b_nm = self.cls_bal_vec(f_b, embed=None)  # [B,C]
 
         if not return_all:
-            return z_b  # 기본 반환은 balanced logits로 유지
+            return z_b
 
         return {
             "z_b": z_b, "z_h": z_h, "z_t": z_t,
             "z_b_nm": z_b_nm, "z_h_nm": z_h_nm, "z_t_nm": z_t_nm,
-            "embed_mean_b": f_hat_b, "embed_mean_h": f_h, "embed_mean_t": f_t,
+            "feat_b": f_b, "feat_h": f_h, "feat_t": f_t,
         }
+
     
